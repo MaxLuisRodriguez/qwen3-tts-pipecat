@@ -1,0 +1,5 @@
+aiohttp>=3.9.0
+asyncio
+
+# TODO: Add Pipecat when ready to integrate
+# pipecat-ai>=0.0.1

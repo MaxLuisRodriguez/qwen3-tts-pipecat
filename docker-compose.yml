@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  llm-service:
+    build:
+      context: ./services/llm_megakernel
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    # GPU passthrough (requires NVIDIA Container Toolkit)
+    # Uncomment and adjust device IDs as needed
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      # Mount kernel directory so service can import it
+      - ./kernel:/app/kernel:ro
+    networks:
+      - megakernel-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  tts-service:
+    build:
+      context: ./services/tts_qwen3
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - PYTHONUNBUFFERED=1
+    # GPU passthrough for TTS model (when integrated)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - megakernel-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  pipecat-demo:
+    build:
+      context: ./pipecat_demo
+      dockerfile: Dockerfile
+    depends_on:
+      - llm-service
+      - tts-service
+    environment:
+      - LLM_SERVICE_URL=http://llm-service:8000
+      - TTS_SERVICE_URL=http://tts-service:8001
+      - PYTHONUNBUFFERED=1
+    networks:
+      - megakernel-net
+    # Run once and exit (or keep running if interactive)
+    command: python app.py
+
+networks:
+  megakernel-net:
+    driver: bridge
+
+# Notes:
+# 1. GPU passthrough requires NVIDIA Container Toolkit:
+#    - Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#    - Verify: docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
+#
+# 2. To build and run:
+#    docker-compose build
+#    docker-compose up
+#
+# 3. To run without GPU (for testing):
+#    Comment out the 'deploy.resources.reservations.devices' sections
+#
+# 4. Dockerfiles need to be created in each service directory
+#    See services/*/Dockerfile (to be created)
