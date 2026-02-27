@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import json
+import os
 
 from wrapper import MegakernelDecoder
 
@@ -23,10 +24,9 @@ class GenerateRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize decoder on startup."""
-    # TODO: Load default weights or wait for explicit load_weights call
-    # decoder.load_weights("Qwen/Qwen3-0.6B")
-    pass
+    """Optionally preload weights on startup."""
+    if os.getenv("LLM_PRELOAD_WEIGHTS", "0") == "1":
+        decoder.load_weights(os.getenv("QWEN_MEGAKERNEL_MODEL_NAME"))
 
 
 @app.post("/generate")
@@ -83,7 +83,8 @@ async def health():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "weights_loaded": decoder._weights_loaded
+        "weights_loaded": decoder._weights_loaded,
+        "model_name": decoder.loaded_model_name,
     }
 
 

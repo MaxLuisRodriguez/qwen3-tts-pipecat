@@ -1,5 +1,4 @@
 aiohttp>=3.9.0
-asyncio
-
-# TODO: Add Pipecat when ready to integrate
-# pipecat-ai>=0.0.1
+python-dotenv>=1.0.1
+loguru>=0.7.2
+pipecat-ai[daily,deepgram,cartesia,silero]

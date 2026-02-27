@@ -1,74 +1,70 @@
 # Pipecat Demo
 
-Minimal Pipecat pipeline demo skeleton that demonstrates the streaming flow between STT, LLM, and TTS services.
-
-## Overview
-
-This demo shows how to wire together:
-1. **STT** (Speech-to-Text) - converts audio to text
-2. **LLM** - generates response tokens (calls `services/llm_megakernel`)
-3. **TTS** (Text-to-Speech) - converts text to audio (calls `services/tts_qwen3`)
-4. **Audio Output** - plays synthesized audio
-
-Currently implemented as a mock pipeline runner that demonstrates the streaming flow. Actual Pipecat integration is marked with TODO comments.
+Pipecat voice pipeline using:
+- **Deepgram STT**
+- **Megakernel LLM service** (`services/llm_megakernel`)
+- **Cartesia TTS**
+- **Daily transport** (WebRTC room link)
 
 ## Setup
+
+Install dependencies in the same Python environment used by the kernel:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Prerequisites
+## Environment
 
-The LLM and TTS services must be running:
-- LLM service: `http://localhost:8000`
-- TTS service: `http://localhost:8001`
+Configure credentials in repo root:
 
-See their respective READMEs for how to start them.
+```bash
+.env.pipecat
+```
+
+Required:
+- `DEEPGRAM_API_KEY`
+- `CARTESIA_API_KEY`
+- Daily credentials:
+  - either `DAILY_ROOM_URL` + `DAILY_ROOM_TOKEN`
+  - or `DAILY_API_KEY` (app auto-creates room and token)
+
+Optional:
+- `CARTESIA_VOICE_ID`
+- `PIPECAT_SYSTEM_PROMPT`
+- `PIPECAT_MAX_TOKENS`
+- `LLM_SERVICE_URL`
 
 ## Running
 
+Start the LLM service and Pipecat app together:
+
 ```bash
+bash scripts/run_local.sh
+```
+
+Or run manually:
+
+```bash
+# terminal 1
+cd services/llm_megakernel
+python server.py
+
+# terminal 2
+cd pipecat_demo
 python app.py
 ```
 
-This will run a mock pipeline that:
-1. Simulates audio input
-2. Calls STT (mock)
-3. Streams tokens from LLM service
-4. Streams audio from TTS service
-5. Logs the output (audio playback is stubbed)
+When `app.py` starts it prints a Daily room URL. Open it in browser, allow mic/audio, and talk.
 
-## Current Status
-
-⚠️ **Skeleton Implementation**: This is a mock pipeline runner. Actual Pipecat integration is marked with TODO comments in `app.py`.
-
-## Integration TODO
-
-1. Install and import Pipecat framework
-2. Replace `MockPipelineRunner` with actual `PipelineRunner`
-3. Add STT processor (e.g., Whisper, Deepgram)
-4. Create custom LLM processor that calls our LLM service
-5. Create custom TTS processor that calls our TTS service
-6. Add audio output processor (e.g., PlayAudioProcessor, WebRTC output)
-7. Wire everything together in a `Pipeline` object
-
-## Architecture
+## Pipeline
 
 ```
-Audio Input → STT → Text
-                      ↓
-                   LLM Service (streaming tokens)
-                      ↓
-                   TTS Service (streaming audio)
-                      ↓
-                   Audio Output
+Daily audio input
+  -> Deepgram STT
+  -> User-turn aggregator
+  -> HTTP call to local megakernel LLM service
+  -> TTSSpeakFrame
+  -> Cartesia TTS
+  -> Daily audio output
 ```
-
-## Example Flow
-
-1. User speaks → Audio captured
-2. STT processes audio → "Hello, how are you?"
-3. LLM service streams tokens → "I'm", "doing", "well", "thank", "you"
-4. TTS service streams audio chunks → PCM audio data
-5. Audio output plays → User hears response

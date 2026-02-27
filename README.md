@@ -122,6 +122,8 @@ Or use the convenience script:
 ./scripts/run_local.sh
 ```
 
+Pipecat runtime config is loaded from `.env.pipecat`.
+
 ## Docker Compose
 
 Start all services with Docker Compose:
@@ -147,8 +149,8 @@ Original Qwen megakernel implementation. Optimized for Qwen3-0.6B on RTX 5090.
 Python wrapper around the kernel with FastAPI streaming server.
 
 - **API**: REST + Server-Sent Events (SSE)
-- **Status**: Stub implementation (returns fake tokens)
-- **TODO**: Integrate with actual kernel code
+- **Status**: Integrated with kernel-backed streaming generation
+- **Note**: Must run in an environment with kernel dependencies and weights
 
 ### `/services/tts_qwen3`
 
@@ -160,10 +162,10 @@ Streaming TTS service skeleton.
 
 ### `/pipecat_demo`
 
-Minimal Pipecat pipeline demo showing the full flow.
+Pipecat voice pipeline demo with Daily transport.
 
-- **Status**: Mock pipeline runner
-- **TODO**: Integrate actual Pipecat framework
+- **Status**: Integrated (Deepgram STT + Megakernel LLM service + Cartesia TTS)
+- **Config**: Uses `.env.pipecat`
 
 ## Development Status
 
@@ -172,9 +174,9 @@ Minimal Pipecat pipeline demo showing the full flow.
 - ✅ Repository structure created
 - ✅ Kernel code moved (untouched)
 - ✅ Service skeletons created
-- ⚠️ LLM service: Stub (needs kernel integration)
+- ✅ LLM service: Megakernel wrapper integrated
 - ⚠️ TTS service: Stub (needs model integration)
-- ⚠️ Pipecat demo: Mock (needs framework integration)
+- ✅ Pipecat demo: Integrated (Daily + Deepgram + Cartesia + Megakernel LLM)
 
 ## Requirements
 
@@ -209,3 +211,5 @@ Original megakernel by [AlpinDale](https://github.com/AlpinDale/qwen_megakernel)
 ## License
 
 See original repository for license information.
+
+

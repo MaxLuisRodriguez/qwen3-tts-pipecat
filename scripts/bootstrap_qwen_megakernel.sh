@@ -211,6 +211,9 @@ setup_python_env() {
   retry python -m pip install --upgrade pip || fail "Failed to upgrade pip."
   retry pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128 || fail "Failed to install torch cu128 wheel."
   retry pip install "transformers>=4.51.0" triton accelerate ninja huggingface_hub || fail "Failed to install Python dependencies."
+  retry pip install -r "${REPO_ROOT}/services/llm_megakernel/requirements.txt" || fail "Failed to install llm service dependencies."
+  retry pip install -r "${REPO_ROOT}/services/tts_qwen3/requirements.txt" || fail "Failed to install tts service dependencies."
+  retry pip install -r "${REPO_ROOT}/pipecat_demo/requirements.txt" || fail "Failed to install pipecat dependencies."
 }
 
 verify_torch_gpu() {

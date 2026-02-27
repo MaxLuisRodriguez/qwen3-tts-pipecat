@@ -12,6 +12,9 @@ This service provides a REST API for streaming token generation using the Qwen m
 pip install -r requirements.txt
 ```
 
+Run this service in an environment that can import `../../kernel/qwen_megakernel`
+(typically `kernel/.venv` created by the bootstrap script).
+
 ## Running Locally
 
 ```bash
@@ -19,6 +22,14 @@ python server.py
 ```
 
 The server will start on `http://localhost:8000`.
+
+Optional preload on startup:
+
+```bash
+export LLM_PRELOAD_WEIGHTS=1
+export QWEN_MEGAKERNEL_MODEL_NAME=kernel/weights/Qwen3-0.6B
+python server.py
+```
 
 ## API Endpoints
 
@@ -59,10 +70,9 @@ Health check endpoint.
 
 ## Current Status
 
-⚠️ **Stub Implementation**: The service currently returns fake tokens. Integration with the actual kernel is marked with TODO comments in `wrapper.py`.
+✅ **Kernel-backed Streaming**: The wrapper now loads real model weights and streams
+incremental decoded text from the megakernel decode loop.
 
-## Integration TODO
-
-1. Import `qwen_megakernel` from `../../kernel/`
-2. Implement `MegakernelDecoder.load_weights()` to call kernel's `load_weights()`
-3. Implement `MegakernelDecoder.generate_stream()` to call kernel's decoder in a streaming loop
+- `load_weights(weights_path)` loads from Hugging Face model id or local path.
+- `generate_stream(prompt, max_tokens)` lazily loads weights if needed and emits
+  incremental text deltas as tokens are generated.

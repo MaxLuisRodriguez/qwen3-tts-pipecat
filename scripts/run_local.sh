@@ -14,6 +14,62 @@ echo -e "${GREEN}Starting Qwen Megakernel Services...${NC}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Always run with the kernel virtualenv so qwen_megakernel imports work.
+KERNEL_VENV="$REPO_ROOT/kernel/.venv"
+PYTHON_BIN="$KERNEL_VENV/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo -e "${YELLOW}Missing kernel virtualenv at $KERNEL_VENV${NC}"
+    echo -e "${YELLOW}Run: bash scripts/bootstrap_qwen_megakernel.sh${NC}"
+    exit 1
+fi
+export PATH="$KERNEL_VENV/bin:$PATH"
+echo -e "${GREEN}Using Python: $PYTHON_BIN${NC}"
+
+# Load shared runtime config if present.
+if [ -f "$REPO_ROOT/.env.qwen_megakernel" ]; then
+    # shellcheck disable=SC1091
+    set -a
+    source "$REPO_ROOT/.env.qwen_megakernel"
+    set +a
+fi
+
+# Load Pipecat runtime config if present.
+if [ -f "$REPO_ROOT/.env.pipecat" ]; then
+    # shellcheck disable=SC1091
+    set -a
+    source "$REPO_ROOT/.env.pipecat"
+    set +a
+fi
+
+# Preload LLM weights on startup unless explicitly disabled.
+: "${LLM_PRELOAD_WEIGHTS:=1}"
+export LLM_PRELOAD_WEIGHTS
+
+# Validate Pipecat provider credentials before starting processes.
+if [ -z "${DEEPGRAM_API_KEY:-}" ]; then
+    echo -e "${YELLOW}Missing DEEPGRAM_API_KEY. Set it in .env.pipecat.${NC}"
+    exit 1
+fi
+if [ -z "${CARTESIA_API_KEY:-}" ]; then
+    echo -e "${YELLOW}Missing CARTESIA_API_KEY. Set it in .env.pipecat.${NC}"
+    exit 1
+fi
+if { [ -z "${DAILY_ROOM_URL:-}" ] || [ -z "${DAILY_ROOM_TOKEN:-}" ]; } && [ -z "${DAILY_API_KEY:-}" ]; then
+    echo -e "${YELLOW}Missing Daily credentials. Set DAILY_API_KEY or DAILY_ROOM_URL+DAILY_ROOM_TOKEN in .env.pipecat.${NC}"
+    exit 1
+fi
+
+# Normalize local model path relative to repo root.
+if [ -n "${QWEN_MEGAKERNEL_MODEL_NAME:-}" ]; then
+    if [[ "$QWEN_MEGAKERNEL_MODEL_NAME" != /* ]] && [[ ! "$QWEN_MEGAKERNEL_MODEL_NAME" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+        QWEN_MEGAKERNEL_MODEL_NAME="$REPO_ROOT/${QWEN_MEGAKERNEL_MODEL_NAME#./}"
+        export QWEN_MEGAKERNEL_MODEL_NAME
+    fi
+fi
+
+# TTS service is optional now (Pipecat demo uses Cartesia directly by default).
+: "${START_TTS_SERVICE:=0}"
+
 # Check if services are already running
 check_port() {
     if lsof -Pi :$1 -sTCP:LISTEN -t >/dev/null 2>&1 ; then
@@ -27,7 +83,7 @@ check_port() {
 if check_port 8000; then
     echo -e "${GREEN}Starting LLM service on port 8000...${NC}"
     cd services/llm_megakernel
-    python server.py &
+    "$PYTHON_BIN" server.py &
     LLM_PID=$!
     cd "$REPO_ROOT"
     echo "LLM service PID: $LLM_PID"
@@ -38,11 +94,11 @@ fi
 # Wait a bit for service to start
 sleep 2
 
-# Start TTS service in background
-if check_port 8001; then
+# Start TTS service in background (optional)
+if [ "$START_TTS_SERVICE" = "1" ] && check_port 8001; then
     echo -e "${GREEN}Starting TTS service on port 8001...${NC}"
     cd services/tts_qwen3
-    python server.py &
+    "$PYTHON_BIN" server.py &
     TTS_PID=$!
     cd "$REPO_ROOT"
     echo "TTS service PID: $TTS_PID"
@@ -74,7 +130,7 @@ fi
 # Run the demo
 echo -e "${GREEN}Running Pipecat demo...${NC}"
 cd pipecat_demo
-python app.py
+"$PYTHON_BIN" app.py
 
 # Cleanup on exit
 cleanup() {
