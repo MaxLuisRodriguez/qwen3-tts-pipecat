@@ -50,10 +50,6 @@ if [ -z "${DEEPGRAM_API_KEY:-}" ]; then
     echo -e "${YELLOW}Missing DEEPGRAM_API_KEY. Set it in .env.pipecat.${NC}"
     exit 1
 fi
-if [ -z "${CARTESIA_API_KEY:-}" ]; then
-    echo -e "${YELLOW}Missing CARTESIA_API_KEY. Set it in .env.pipecat.${NC}"
-    exit 1
-fi
 if { [ -z "${DAILY_ROOM_URL:-}" ] || [ -z "${DAILY_ROOM_TOKEN:-}" ]; } && [ -z "${DAILY_API_KEY:-}" ]; then
     echo -e "${YELLOW}Missing Daily credentials. Set DAILY_API_KEY or DAILY_ROOM_URL+DAILY_ROOM_TOKEN in .env.pipecat.${NC}"
     exit 1
@@ -67,8 +63,8 @@ if [ -n "${QWEN_MEGAKERNEL_MODEL_NAME:-}" ]; then
     fi
 fi
 
-# TTS service is optional now (Pipecat demo uses Cartesia directly by default).
-: "${START_TTS_SERVICE:=0}"
+# Start local Qwen TTS by default (used by pipecat_demo/app.py).
+: "${START_TTS_SERVICE:=1}"
 
 # Check if services are already running
 check_port() {

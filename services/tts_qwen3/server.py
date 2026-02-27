@@ -1,4 +1,4 @@
-"""Streaming TTS server backed by Qwen/Qwen3-TTS."""
+"""Streaming TTS server backed by Qwen3-TTS checkpoints."""
 
 from __future__ import annotations
 
@@ -14,12 +14,7 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from transformers import AutoProcessor
-
-try:
-    from transformers import Qwen3TTSForConditionalGeneration
-except ImportError:
-    Qwen3TTSForConditionalGeneration = None
+from qwen_tts import Qwen3TTSModel
 
 app = FastAPI(title="Qwen3 TTS Service")
 
@@ -45,74 +40,54 @@ class Qwen3TTSEngine:
     """Lazy-loaded Qwen3-TTS inference wrapper."""
 
     def __init__(self):
-        self.model_name = os.getenv("QWEN3_TTS_MODEL_NAME", "Qwen/Qwen3-TTS")
-        self.default_voice = os.getenv("QWEN3_TTS_DEFAULT_VOICE", "Cherry")
+        self.model_name = os.getenv(
+            "QWEN3_TTS_MODEL_NAME", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+        )
+        self.default_voice = os.getenv("QWEN3_TTS_DEFAULT_VOICE", "vivian")
         self.attn_implementation = os.getenv("QWEN3_TTS_ATTN_IMPL", "sdpa")
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._dtype = torch.bfloat16 if self._device.type == "cuda" else torch.float32
         self._load_lock = threading.Lock()
         self._generate_lock = threading.Lock()
-        self._processor = None
         self._model = None
 
     @property
     def loaded(self) -> bool:
-        return self._processor is not None and self._model is not None
-
-    def _build_prompt(self, text: str, voice: str | None) -> str:
-        # Qwen3-TTS model card pattern: "<speaker>: <chat_template_text>".
-        conversation = [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": f"Convert the text to speech:{text}"}],
-            }
-        ]
-        chat_text = self._processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
-        speaker = (voice or self.default_voice).strip()
-        return f"{speaker}: {chat_text}" if speaker else chat_text
+        return self._model is not None
 
     def load(self):
         if self.loaded:
             return
-        if Qwen3TTSForConditionalGeneration is None:
-            raise RuntimeError(
-                "Your transformers build does not expose Qwen3TTSForConditionalGeneration. "
-                "Upgrade transformers to a version that includes Qwen3-TTS."
-            )
-
         with self._load_lock:
             if self.loaded:
                 return
-            self._processor = AutoProcessor.from_pretrained(self.model_name)
-            self._model = Qwen3TTSForConditionalGeneration.from_pretrained(
+            self._model = Qwen3TTSModel.from_pretrained(
                 self.model_name,
-                torch_dtype=self._dtype,
-                device_map="auto" if self._device.type == "cuda" else None,
+                device_map="cuda:0" if self._device.type == "cuda" else "cpu",
+                dtype=self._dtype,
                 attn_implementation=self.attn_implementation,
             )
-            self._model.eval()
+            self._model.model.eval()
             if self._device.type != "cuda":
-                self._model.to(self._device)
+                self._model.model.to(self._device)
 
     def synthesize(self, text: str, voice: str | None, max_new_tokens: int) -> np.ndarray:
         self.load()
-        prompt = self._build_prompt(text=text, voice=voice)
+        speaker = (voice or self.default_voice).strip() or self.default_voice
+        language = os.getenv("QWEN3_TTS_LANGUAGE", "auto")
 
         with self._generate_lock:
-            inputs = self._processor(text=[prompt], padding=True, return_tensors="pt")
-            inputs = inputs.to("cuda" if self._device.type == "cuda" else self._device)
-
             with torch.inference_mode():
-                generated = self._model.generate(
-                    **inputs,
-                    use_audio_in_video=True,
-                    return_audio=True,
+                wavs, _sr = self._model.generate_custom_voice(
+                    text=text,
+                    speaker=speaker,
+                    language=language,
                     max_new_tokens=max_new_tokens,
                 )
 
-        audio = generated.reshape(-1).detach().float().cpu().numpy()
+        if not wavs:
+            raise RuntimeError("Model returned no audio.")
+        audio = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
         if audio.size == 0:
             raise RuntimeError("Model returned empty audio.")
         return audio

@@ -164,7 +164,7 @@ Streaming TTS service backed by Qwen3-TTS.
 
 Pipecat voice pipeline demo with Daily transport.
 
-- **Status**: Integrated (Deepgram STT + Megakernel LLM service + Cartesia TTS)
+- **Status**: Integrated (Deepgram STT + Megakernel LLM service + local Qwen3-TTS)
 - **Config**: Uses `.env.pipecat`
 
 ## Development Status
@@ -176,7 +176,20 @@ Pipecat voice pipeline demo with Daily transport.
 - ✅ Service skeletons created
 - ✅ LLM service: Megakernel wrapper integrated
 - ✅ TTS service: Qwen3-TTS integration complete
-- ✅ Pipecat demo: Integrated (Daily + Deepgram + Cartesia + Megakernel LLM)
+- ✅ Pipecat demo: Integrated (Daily + Deepgram + local Qwen3-TTS + Megakernel LLM)
+
+## Benchmarking
+
+With services running (`bash scripts/run_local.sh`), collect local metrics:
+
+```bash
+kernel/.venv/bin/python scripts/benchmark_stack.py
+```
+
+This prints:
+- Megakernel LLM TTFT and decode tok/s from `services/llm_megakernel`
+- TTS first-chunk latency (TTFC), total synthesis time, and RTF from `services/tts_qwen3`
+- A simple e2e estimate (`llm_ttft + tts_first_chunk`)
 
 ## Requirements
 
@@ -211,5 +224,4 @@ Original megakernel by [AlpinDale](https://github.com/AlpinDale/qwen_megakernel)
 ## License
 
 See original repository for license information.
-
 

@@ -1,4 +1,4 @@
-"""Pipecat voice app: Deepgram STT + Megakernel LLM service + Cartesia TTS."""
+"""Pipecat voice app: Deepgram STT + Megakernel LLM service + local Qwen TTS."""
 
 from __future__ import annotations
 
@@ -7,27 +7,25 @@ import json
 import os
 import time
 from dataclasses import dataclass
+from typing import AsyncGenerator
 
 import aiohttp
 from dotenv import load_dotenv
 
-from pipecat.frames.frames import EndFrame, TTSSpeakFrame
+from pipecat.frames.frames import EndFrame, ErrorFrame, Frame, TTSSpeakFrame, TTSStartedFrame, TTSStoppedFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.services.tts_service import TTSService
 from pipecat.transports.daily.transport import DailyParams, DailyTransport
+from pipecat.utils.tracing.service_decorators import traced_tts
 
 try:
     from pipecat.services.deepgram import DeepgramSTTService
 except ImportError:
     from pipecat.services.deepgram.stt import DeepgramSTTService
-
-try:
-    from pipecat.services.cartesia import CartesiaTTSService
-except ImportError:
-    from pipecat.services.cartesia.tts import CartesiaTTSService
 
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -103,12 +101,85 @@ class MegakernelLLMClient:
             parts.append(chunk)
 
         response = "".join(parts).strip()
+        # Megakernel decode can drift into repeated multi-line patterns; keep
+        # only the first concise sentence for low-latency voice playback.
+        response = response.replace("\r", "")
+        first_line = response.splitlines()[0].strip() if response else ""
+        if first_line:
+            response = first_line
+        if ". " in response:
+            response = response.split(". ", 1)[0].strip() + "."
+        response = response[:160].strip()
         if not response:
             response = "I did not catch that. Could you repeat it?"
 
         self._history.append(("user", user_text))
         self._history.append(("assistant", response))
         return response
+
+
+class LocalQwenTTSService(TTSService):
+    """TTS service backed by services/tts_qwen3/server.py."""
+
+    def __init__(
+        self,
+        *,
+        aiohttp_session: aiohttp.ClientSession,
+        base_url: str,
+        voice: str | None = None,
+        max_new_tokens: int = 1024,
+        in_sample_rate: int = 24000,
+        **kwargs,
+    ):
+        super().__init__(sample_rate=in_sample_rate, **kwargs)
+        self._session = aiohttp_session
+        self._base_url = base_url.rstrip("/")
+        self._voice = voice
+        self._max_new_tokens = max_new_tokens
+        self._in_sample_rate = in_sample_rate
+
+    def can_generate_metrics(self) -> bool:
+        return True
+
+    @traced_tts
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        payload = {
+            "text": text,
+            "voice": self._voice,
+            "max_new_tokens": self._max_new_tokens,
+        }
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            await self.start_ttfb_metrics()
+            async with self._session.post(
+                f"{self._base_url}/synthesize_binary",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=240),
+            ) as response:
+                if response.status != 200:
+                    error = await response.text()
+                    yield ErrorFrame(
+                        error=f"Qwen TTS HTTP {response.status} from {self._base_url}/synthesize_binary: {error}"
+                    )
+                    return
+
+                await self.start_tts_usage_metrics(text)
+                yield TTSStartedFrame(context_id=context_id)
+
+                async for frame in self._stream_audio_frames_from_iterator(
+                    response.content.iter_chunked(self.chunk_size),
+                    in_sample_rate=self._in_sample_rate,
+                    context_id=context_id,
+                ):
+                    await self.stop_ttfb_metrics()
+                    yield frame
+        except Exception as exc:
+            yield ErrorFrame(error=f"Qwen TTS request failed: {exc}")
+        finally:
+            await self.stop_ttfb_metrics()
+            yield TTSStoppedFrame(context_id=context_id)
 
 
 async def _create_daily_session(api_key: str) -> DailySession:
@@ -170,10 +241,10 @@ def _require_env(name: str) -> str:
 
 async def main():
     deepgram_key = _require_env("DEEPGRAM_API_KEY")
-    cartesia_key = _require_env("CARTESIA_API_KEY")
-    cartesia_voice_id = os.getenv(
-        "CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"
-    )
+    tts_service_url = os.getenv("TTS_SERVICE_URL", "http://localhost:8001")
+    qwen_tts_voice = os.getenv("QWEN3_TTS_VOICE", os.getenv("QWEN3_TTS_DEFAULT_VOICE", "vivian"))
+    qwen_tts_sample_rate = int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
+    qwen_tts_max_new_tokens = int(os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", "1024"))
 
     daily_session = await _resolve_daily_session()
     print(f"[pipecat] Join this Daily room: {daily_session.room_url}")
@@ -189,7 +260,13 @@ async def main():
         )
 
         stt = DeepgramSTTService(api_key=deepgram_key)
-        tts = CartesiaTTSService(api_key=cartesia_key, voice_id=cartesia_voice_id)
+        tts = LocalQwenTTSService(
+            aiohttp_session=http_session,
+            base_url=tts_service_url,
+            voice=qwen_tts_voice,
+            in_sample_rate=qwen_tts_sample_rate,
+            max_new_tokens=qwen_tts_max_new_tokens,
+        )
 
         context = LLMContext(
             [

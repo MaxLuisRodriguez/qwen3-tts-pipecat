@@ -3,7 +3,7 @@
 Pipecat voice pipeline using:
 - **Deepgram STT**
 - **Megakernel LLM service** (`services/llm_megakernel`)
-- **Cartesia TTS**
+- **Local Qwen3-TTS service** (`services/tts_qwen3`)
 - **Daily transport** (WebRTC room link)
 
 ## Setup
@@ -24,13 +24,13 @@ Configure credentials in repo root:
 
 Required:
 - `DEEPGRAM_API_KEY`
-- `CARTESIA_API_KEY`
 - Daily credentials:
   - either `DAILY_ROOM_URL` + `DAILY_ROOM_TOKEN`
   - or `DAILY_API_KEY` (app auto-creates room and token)
 
 Optional:
-- `CARTESIA_VOICE_ID`
+- `QWEN3_TTS_MODEL_NAME`
+- `QWEN3_TTS_DEFAULT_VOICE`
 - `PIPECAT_SYSTEM_PROMPT`
 - `PIPECAT_MAX_TOKENS`
 - `LLM_SERVICE_URL`
@@ -51,6 +51,10 @@ cd services/llm_megakernel
 python server.py
 
 # terminal 2
+cd services/tts_qwen3
+python server.py
+
+# terminal 3
 cd pipecat_demo
 python app.py
 ```
@@ -65,6 +69,6 @@ Daily audio input
   -> User-turn aggregator
   -> HTTP call to local megakernel LLM service
   -> TTSSpeakFrame
-  -> Cartesia TTS
+  -> Local Qwen3-TTS HTTP service
   -> Daily audio output
 ```

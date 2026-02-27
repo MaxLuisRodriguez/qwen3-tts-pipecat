@@ -1,6 +1,6 @@
 # Qwen3 TTS Service
 
-Streaming text-to-speech service backed by `Qwen/Qwen3-TTS`.
+Streaming text-to-speech service backed by Qwen3-TTS checkpoints.
 
 ## Overview
 
@@ -28,12 +28,15 @@ Server runs on `http://localhost:8001`.
 
 ## Environment Variables
 
-- `QWEN3_TTS_MODEL_NAME` (default: `Qwen/Qwen3-TTS`)
-- `QWEN3_TTS_DEFAULT_VOICE` (default: `Cherry`)
+- `QWEN3_TTS_MODEL_NAME` (default: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`)
+- `QWEN3_TTS_DEFAULT_VOICE` (default: `vivian`)
 - `QWEN3_TTS_ATTN_IMPL` (default: `sdpa`)
 - `QWEN3_TTS_SAMPLE_RATE` (default: `24000`)
 - `QWEN3_TTS_CHUNK_SIZE` (default: `1600`)
 - `TTS_PRELOAD_MODEL` (`1` to load at startup, default `0`)
+
+For `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, valid speakers include:
+`serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`, `eric`, `dylan`.
 
 ## API Endpoints
 
