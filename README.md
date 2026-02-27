@@ -12,7 +12,7 @@ qwen_megakernel/
 │   └── requirements.txt
 ├── services/
 │   ├── llm_megakernel/        # LLM streaming service wrapper
-│   └── tts_qwen3/             # TTS streaming service skeleton
+│   └── tts_qwen3/             # Qwen3-TTS streaming service
 ├── pipecat_demo/              # Pipecat pipeline demo skeleton
 ├── scripts/                   # Utility scripts
 ├── docker-compose.yml         # Docker orchestration
@@ -154,11 +154,11 @@ Python wrapper around the kernel with FastAPI streaming server.
 
 ### `/services/tts_qwen3`
 
-Streaming TTS service skeleton.
+Streaming TTS service backed by Qwen3-TTS.
 
 - **Format**: 16-bit PCM, 24kHz, mono
-- **Status**: Stub implementation (generates silence)
-- **TODO**: Integrate Qwen3 TTS model
+- **Status**: Integrated with `Qwen/Qwen3-TTS` inference
+- **API**: `/synthesize` (SSE) and `/synthesize_binary` (raw PCM)
 
 ### `/pipecat_demo`
 
@@ -169,13 +169,13 @@ Pipecat voice pipeline demo with Daily transport.
 
 ## Development Status
 
-⚠️ **Current State**: This is a restructured skeleton. Most components are stubbed with clear TODOs:
+⚠️ **Current State**: This is a restructured monorepo. Some components are still stubbed with clear TODOs:
 
 - ✅ Repository structure created
 - ✅ Kernel code moved (untouched)
 - ✅ Service skeletons created
 - ✅ LLM service: Megakernel wrapper integrated
-- ⚠️ TTS service: Stub (needs model integration)
+- ✅ TTS service: Qwen3-TTS integration complete
 - ✅ Pipecat demo: Integrated (Daily + Deepgram + Cartesia + Megakernel LLM)
 
 ## Requirements

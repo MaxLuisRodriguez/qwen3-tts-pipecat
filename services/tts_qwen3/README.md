@@ -1,17 +1,16 @@
 # Qwen3 TTS Service
 
-Streaming text-to-speech service skeleton for Qwen3 TTS model.
+Streaming text-to-speech service backed by `Qwen/Qwen3-TTS`.
 
 ## Overview
 
-This service provides a REST API for streaming audio synthesis. Currently implemented as a stub that generates silence chunks, with clear TODOs for integrating the actual Qwen3 TTS model.
+This service exposes a simple HTTP API:
+- text in
+- chunked 24kHz 16-bit PCM out
 
-## Audio Format
-
-- **Sample Rate**: 24,000 Hz
-- **Format**: 16-bit PCM, mono
-- **Chunk Size**: 1,600 samples (~66ms per chunk)
-- **Bytes per Chunk**: 3,200 bytes
+It loads Qwen3-TTS lazily (or on startup if configured) and supports:
+- binary PCM streaming (`/synthesize_binary`)
+- SSE base64 chunk streaming (`/synthesize`)
 
 ## Setup
 
@@ -19,74 +18,65 @@ This service provides a REST API for streaming audio synthesis. Currently implem
 pip install -r requirements.txt
 ```
 
-## Running Locally
+## Running
 
 ```bash
 python server.py
 ```
 
-The server will start on `http://localhost:8001`.
+Server runs on `http://localhost:8001`.
+
+## Environment Variables
+
+- `QWEN3_TTS_MODEL_NAME` (default: `Qwen/Qwen3-TTS`)
+- `QWEN3_TTS_DEFAULT_VOICE` (default: `Cherry`)
+- `QWEN3_TTS_ATTN_IMPL` (default: `sdpa`)
+- `QWEN3_TTS_SAMPLE_RATE` (default: `24000`)
+- `QWEN3_TTS_CHUNK_SIZE` (default: `1600`)
+- `TTS_PRELOAD_MODEL` (`1` to load at startup, default `0`)
 
 ## API Endpoints
 
-### POST /synthesize
+### `POST /synthesize`
 
-Stream audio chunks as Server-Sent Events (SSE).
+SSE stream with base64-encoded PCM chunks.
 
-**Request Body:**
+Request body:
+
 ```json
 {
-  "text": "Hello, this is a test."
+  "text": "Hello, this is a test.",
+  "voice": "Cherry",
+  "max_new_tokens": 1024
 }
 ```
 
-**Response:** SSE stream with base64-encoded audio chunks
-```
-data: {"chunk_index": 0, "audio_base64": "...", "sample_rate": 24000, "chunk_size_samples": 1600}
-data: {"chunk_index": 1, "audio_base64": "...", "sample_rate": 24000, "chunk_size_samples": 1600}
-data: {"done": true}
-```
+Response events:
+- `chunk_index`
+- `audio_base64`
+- `sample_rate`
+- `chunk_size_samples`
+- `ttfc_ms` (included on first chunk)
+- final `{ "done": true }`
 
-### POST /synthesize_binary
+### `POST /synthesize_binary`
 
-Stream raw PCM audio chunks (binary format).
+Raw PCM stream (16-bit mono @ 24kHz).
 
-**Request Body:**
-```json
-{
-  "text": "Hello, this is a test."
-}
-```
+Request body matches `/synthesize`.
 
-**Response:** Raw binary PCM stream (Content-Type: `audio/pcm`)
+Response headers include:
+- `Content-Type: audio/pcm; rate=24000; channels=1; width=16`
+- `X-TTFC-Ms`
 
-### GET /health
+### `POST /load_model`
 
-Health check endpoint.
+Force model load before synthesis.
 
-### GET /spec
+### `GET /health`
 
-Get audio format specification.
+Shows model load status and selected device.
 
-## Current Status
+### `GET /spec`
 
-⚠️ **Stub Implementation**: The service currently generates silence chunks. The actual Qwen3 TTS model integration is marked with TODO comments in `server.py`.
-
-## Integration TODO
-
-1. Integrate Qwen3 TTS model (load weights, tokenizer)
-2. Implement `synthesize_audio_stub()` to call actual model inference
-3. Convert model output to 16-bit PCM format
-4. Stream audio chunks as they are generated
-5. Add voice/style parameters to request model
-
-## Interface Contract
-
-**Input:**
-- Text string (UTF-8)
-
-**Output:**
-- Stream of audio chunks
-- Each chunk: 1,600 samples = 3,200 bytes (16-bit PCM)
-- Sample rate: 24,000 Hz
-- Format: Mono (single channel)
+Audio format and chunk configuration.
