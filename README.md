@@ -60,6 +60,20 @@ qwen_megakernel/
 
 ## Quick Start
 
+### Automated bootstrap (recommended on Linux + RTX 5090)
+
+```bash
+cp .env.qwen_megakernel.template .env.qwen_megakernel
+# Edit .env.qwen_megakernel as needed (HF token, cache paths, tuning vars)
+bash scripts/bootstrap_qwen_megakernel.sh
+```
+
+The bootstrap script performs host checks, creates `kernel/.venv`, installs
+`torch==2.7.0` (cu128) + dependencies, validates decode optimization symbols,
+downloads `Qwen/Qwen3-0.6B` weights to `kernel/weights/Qwen3-0.6B`, verifies
+the published SHA256, JIT-builds the extension, and runs
+`python -m qwen_megakernel.bench` (log output in `smoke_test.log`).
+
 ### 1. Build the Kernel
 
 The kernel code is in `kernel/`. Build it from there:

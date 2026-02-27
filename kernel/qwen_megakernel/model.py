@@ -1,6 +1,7 @@
 """Weight loading and high-level decode API for Qwen3-0.6B."""
 
 import math
+import os
 import struct
 
 import torch
@@ -16,13 +17,19 @@ MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
 _decode = torch.ops.qwen_megakernel_C.decode
+_DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
-def load_weights(model_name="Qwen/Qwen3-0.6B", verbose: bool = True):
+def resolve_model_name(model_name: str | None = None) -> str:
+    if model_name:
+        return model_name
+    return os.getenv("QWEN_MEGAKERNEL_MODEL_NAME", _DEFAULT_MODEL_NAME)
+
+
+def load_weights(model_name: str | None = None, verbose: bool = True):
     """Load Qwen3-0.6B weights from HuggingFace into GPU tensors."""
+    model_name = resolve_model_name(model_name)
     if not verbose:
-        import os
-
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
@@ -115,7 +122,7 @@ class Decoder:
         self,
         weights=None,
         tokenizer=None,
-        model_name="Qwen/Qwen3-0.6B",
+        model_name: str | None = None,
         verbose: bool = True,
     ):
         if weights is None:

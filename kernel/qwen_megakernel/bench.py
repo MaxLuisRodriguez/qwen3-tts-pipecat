@@ -1,6 +1,7 @@
 """Benchmark: Qwen megakernel vs PyTorch HuggingFace baseline."""
 
 import gc
+import os
 import time
 import warnings
 
@@ -14,14 +15,20 @@ RUNS = 5
 PROMPT = "Hello"
 CHECK_TOKENS = 8
 RUN_CORRECTNESS = True
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+
+def get_model_name() -> str:
+    return os.getenv("QWEN_MEGAKERNEL_MODEL_NAME", DEFAULT_MODEL_NAME)
 
 
 def bench_pytorch_hf():
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    model_name = get_model_name()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16, device_map="cuda"
+        model_name, torch_dtype=torch.bfloat16, device_map="cuda"
     )
     model.eval()
     input_ids = tokenizer(PROMPT, return_tensors="pt").input_ids.cuda()
@@ -58,7 +65,7 @@ def bench_pytorch_hf():
 def bench_megakernel():
     from qwen_megakernel.model import Decoder
 
-    dec = Decoder(verbose=False)
+    dec = Decoder(model_name=get_model_name(), verbose=False)
 
     def run():
         dec.reset()
@@ -95,9 +102,10 @@ def correctness_check():
     except AttributeError:
         pass
 
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    model_name = get_model_name()
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16, device_map="cuda"
+        model_name, torch_dtype=torch.bfloat16, device_map="cuda"
     )
     model.eval()
 
