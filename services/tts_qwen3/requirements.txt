@@ -6,3 +6,4 @@ torch>=2.7.0
 transformers>=4.57.0
 accelerate>=1.0.0
 sentencepiece>=0.2.0
+qwen-tts
