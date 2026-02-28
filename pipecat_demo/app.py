@@ -45,16 +45,16 @@ class MegakernelLLMClient:
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
         self._base_url = os.getenv("LLM_SERVICE_URL", "http://localhost:8000").rstrip("/")
-        self._max_tokens = int(os.getenv("PIPECAT_MAX_TOKENS", "120"))
+        self._max_tokens = int(os.getenv("PIPECAT_MAX_TOKENS", "256"))
         self._system_prompt = os.getenv(
             "PIPECAT_SYSTEM_PROMPT",
             "You are a concise, helpful voice assistant. Keep responses short and clear.",
         )
         self._history: list[tuple[str, str]] = []
-        self._max_history_turns = int(os.getenv("PIPECAT_MAX_HISTORY_TURNS", "6"))
-        self._response_first_line_only = os.getenv("PIPECAT_RESPONSE_FIRST_LINE_ONLY", "1") == "1"
-        self._response_first_sentence_only = os.getenv("PIPECAT_RESPONSE_FIRST_SENTENCE_ONLY", "1") == "1"
-        self._response_max_chars = int(os.getenv("PIPECAT_RESPONSE_MAX_CHARS", "120"))
+        self._max_history_turns = int(os.getenv("PIPECAT_MAX_HISTORY_TURNS", "8"))
+        self._response_first_line_only = os.getenv("PIPECAT_RESPONSE_FIRST_LINE_ONLY", "0") == "1"
+        self._response_first_sentence_only = os.getenv("PIPECAT_RESPONSE_FIRST_SENTENCE_ONLY", "0") == "1"
+        self._response_max_chars = int(os.getenv("PIPECAT_RESPONSE_MAX_CHARS", "2000"))
 
     def _build_prompt(self, user_text: str) -> str:
         turns = self._history[-self._max_history_turns :]
@@ -104,8 +104,13 @@ class MegakernelLLMClient:
             parts.append(chunk)
 
         response = "".join(parts).strip()
-        # Keep voice output short and stable for lower TTS latency.
         response = response.replace("\r", "")
+        if response.startswith("Assistant:"):
+            response = response[len("Assistant:") :].strip()
+        if "\nUser:" in response:
+            response = response.split("\nUser:", 1)[0].strip()
+        if "\nAssistant:" in response:
+            response = response.split("\nAssistant:", 1)[0].strip()
         if self._response_first_line_only:
             first_line = response.splitlines()[0].strip() if response else ""
             if first_line:
@@ -115,7 +120,8 @@ class MegakernelLLMClient:
                 if ch in ".?!":
                     response = response[: i + 1].strip()
                     break
-        response = response[: self._response_max_chars].strip()
+        if self._response_max_chars > 0:
+            response = response[: self._response_max_chars].strip()
         if not response:
             response = "I did not catch that. Could you repeat it?"
 
@@ -266,7 +272,8 @@ async def main():
     tts_service_url = os.getenv("TTS_SERVICE_URL", "http://localhost:8001")
     qwen_tts_voice = os.getenv("QWEN3_TTS_VOICE", os.getenv("QWEN3_TTS_DEFAULT_VOICE", "vivian"))
     qwen_tts_sample_rate = int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
-    qwen_tts_max_new_tokens = int(os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", "256"))
+    qwen_tts_max_new_tokens = int(os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", "512"))
+    allow_interruptions = os.getenv("PIPECAT_ALLOW_INTERRUPTIONS", "0") == "1"
 
     daily_session = await _resolve_daily_session()
     print(f"[pipecat] Join this Daily room: {daily_session.room_url}")
@@ -316,7 +323,11 @@ async def main():
 
         task = PipelineTask(
             pipeline,
-            params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+            params=PipelineParams(
+                enable_metrics=True,
+                enable_usage_metrics=True,
+                allow_interruptions=allow_interruptions,
+            ),
         )
 
         generation_lock = asyncio.Lock()

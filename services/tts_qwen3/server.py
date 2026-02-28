@@ -1,13 +1,15 @@
-"""Streaming TTS server backed by Qwen3-TTS checkpoints."""
+"""Streaming TTS server backed by Qwen3-TTS with talker megakernel decode."""
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
+import sys
 import threading
 import time
-from typing import Iterator
+from collections.abc import Iterator
 
 import numpy as np
 import torch
@@ -16,12 +18,23 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from qwen_tts import Qwen3TTSModel
 
+_KERNEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../kernel"))
+if _KERNEL_DIR not in sys.path:
+    sys.path.insert(0, _KERNEL_DIR)
+_THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+from megakernel_talker import TalkerMegakernelBackend
+
 app = FastAPI(title="Qwen3 TTS Service")
+LOGGER = logging.getLogger(__name__)
 
 SAMPLE_RATE = int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
-CHUNK_SIZE = int(os.getenv("QWEN3_TTS_CHUNK_SIZE", "1600"))
+CHUNK_SIZE = int(os.getenv("QWEN3_TTS_CHUNK_SIZE", "480"))
 SAMPLE_WIDTH = 2
 BYTES_PER_CHUNK = CHUNK_SIZE * SAMPLE_WIDTH
+DECODE_STRIDE = int(os.getenv("QWEN3_TTS_DECODE_STRIDE", "1"))
 
 
 class TTSRequest(BaseModel):
@@ -37,23 +50,33 @@ class TTSRequest(BaseModel):
 
 
 class Qwen3TTSEngine:
-    """Lazy-loaded Qwen3-TTS inference wrapper."""
+    """Lazy-loaded Qwen3-TTS + talker megakernel backend."""
 
     def __init__(self):
         self.model_name = os.getenv(
             "QWEN3_TTS_MODEL_NAME", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
         )
         self.default_voice = os.getenv("QWEN3_TTS_DEFAULT_VOICE", "vivian")
+        self.default_language = os.getenv("QWEN3_TTS_LANGUAGE", "english").strip().lower()
         self.attn_implementation = os.getenv("QWEN3_TTS_ATTN_IMPL", "sdpa")
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._dtype = torch.bfloat16 if self._device.type == "cuda" else torch.float32
         self._load_lock = threading.Lock()
         self._generate_lock = threading.Lock()
+        self._generate_lock_timeout_s = float(
+            os.getenv("QWEN3_TTS_GENERATE_LOCK_TIMEOUT_S", "180")
+        )
+        # Rebuilding backend per request avoids stale internal state carrying
+        # across turns, which can otherwise cause first-turn-only audio.
+        self._rebuild_backend_per_request = os.getenv(
+            "QWEN3_TTS_REBUILD_BACKEND_PER_REQUEST", "0"
+        ) == "1"
         self._model = None
+        self._backend: TalkerMegakernelBackend | None = None
 
     @property
     def loaded(self) -> bool:
-        return self._model is not None
+        return self._model is not None and self._backend is not None
 
     def load(self):
         if self.loaded:
@@ -70,41 +93,149 @@ class Qwen3TTSEngine:
             self._model.model.eval()
             if self._device.type != "cuda":
                 self._model.model.to(self._device)
+            self._backend = TalkerMegakernelBackend(self._model)
 
-    def synthesize(self, text: str, voice: str | None, max_new_tokens: int) -> np.ndarray:
+    def stream_synthesize(
+        self, text: str, voice: str | None, max_new_tokens: int
+    ) -> tuple[object, Iterator[np.ndarray], int]:
         self.load()
+        if self._backend is None:
+            raise RuntimeError("Megakernel talker backend failed to initialize.")
+        if self._rebuild_backend_per_request:
+            # Keep model weights resident; just rebuild decoding runtime state.
+            self._backend = TalkerMegakernelBackend(self._model)
         speaker = (voice or self.default_voice).strip() or self.default_voice
-        language = os.getenv("QWEN3_TTS_LANGUAGE", "auto")
+        effective_max_new_tokens = _estimate_max_new_tokens(text, max_new_tokens)
+        acquired = self._generate_lock.acquire(timeout=self._generate_lock_timeout_s)
+        if not acquired:
+            # Queue rather than hard-failing under overlap.
+            LOGGER.warning(
+                "TTS generation lock wait exceeded %.1fs; waiting for release.",
+                self._generate_lock_timeout_s,
+            )
+            self._generate_lock.acquire()
+        try:
+            stats, raw_iter = self._backend.stream_audio(
+                text=text,
+                speaker=speaker,
+                language=self.default_language,
+                max_new_tokens=effective_max_new_tokens,
+                decode_stride=DECODE_STRIDE,
+            )
+        except Exception:
+            self._generate_lock.release()
+            raise
 
-        with self._generate_lock:
+        def guarded_iter() -> Iterator[np.ndarray]:
+            try:
+                with torch.no_grad():
+                    for audio in raw_iter:
+                        yield audio
+            finally:
+                self._generate_lock.release()
+
+        return stats, guarded_iter(), effective_max_new_tokens
+
+    def synthesize_fallback(
+        self, text: str, voice: str | None, max_new_tokens: int
+    ) -> tuple[np.ndarray, int]:
+        """
+        Reliability fallback: non-megakernel Qwen3-TTS waveform generation.
+        Used only when the talker streaming path returns no audio for a request.
+        """
+        self.load()
+        if self._model is None:
+            raise RuntimeError("Qwen3-TTS model is not loaded.")
+
+        speaker = (voice or self.default_voice).strip() or self.default_voice
+        effective_max_new_tokens = _estimate_max_new_tokens(text, max_new_tokens)
+        acquired = self._generate_lock.acquire(timeout=self._generate_lock_timeout_s)
+        if not acquired:
+            LOGGER.warning(
+                "TTS fallback lock wait exceeded %.1fs; waiting for release.",
+                self._generate_lock_timeout_s,
+            )
+            self._generate_lock.acquire()
+        try:
             with torch.inference_mode():
                 wavs, _sr = self._model.generate_custom_voice(
                     text=text,
                     speaker=speaker,
-                    language=language,
-                    max_new_tokens=max_new_tokens,
+                    language=self.default_language,
+                    max_new_tokens=effective_max_new_tokens,
                 )
+        finally:
+            self._generate_lock.release()
 
         if not wavs:
-            raise RuntimeError("Model returned no audio.")
+            raise RuntimeError("Fallback TTS produced no waveform.")
         audio = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
         if audio.size == 0:
-            raise RuntimeError("Model returned empty audio.")
-        return audio
+            raise RuntimeError("Fallback TTS produced empty waveform.")
+        return audio, effective_max_new_tokens
 
 
 engine = Qwen3TTSEngine()
 
 
-def _audio_to_pcm16(audio: np.ndarray) -> bytes:
-    clipped = np.clip(audio, -1.0, 1.0)
-    pcm = (clipped * 32767.0).astype(np.int16)
-    return pcm.tobytes()
+def _iter_pcm_chunks_from_audio_stream(audio_iter: Iterator[np.ndarray]) -> Iterator[bytes]:
+    tail = np.empty((0,), dtype=np.int16)
+    try:
+        for audio in audio_iter:
+            if audio.size == 0:
+                continue
+            clipped = np.clip(audio, -1.0, 1.0)
+            pcm = (clipped * 32767.0).astype(np.int16, copy=False)
+            if tail.size:
+                pcm = np.concatenate((tail, pcm))
+                tail = np.empty((0,), dtype=np.int16)
+            start = 0
+            while start + CHUNK_SIZE <= pcm.shape[0]:
+                yield pcm[start : start + CHUNK_SIZE].tobytes()
+                start += CHUNK_SIZE
+            if start < pcm.shape[0]:
+                tail = pcm[start:]
+        if tail.size:
+            yield tail.tobytes()
+    finally:
+        close = getattr(audio_iter, "close", None)
+        if callable(close):
+            close()
 
 
-def _iter_pcm_chunks(pcm_bytes: bytes) -> Iterator[bytes]:
-    for start in range(0, len(pcm_bytes), BYTES_PER_CHUNK):
-        yield pcm_bytes[start : start + BYTES_PER_CHUNK]
+def _merged_audio_iter(
+    first_audio: np.ndarray,
+    audio_iter: Iterator[np.ndarray],
+) -> Iterator[np.ndarray]:
+    try:
+        yield first_audio
+        yield from audio_iter
+    finally:
+        close = getattr(audio_iter, "close", None)
+        if callable(close):
+            close()
+
+
+def _close_iter_safely(audio_iter: Iterator[np.ndarray]) -> None:
+    close = getattr(audio_iter, "close", None)
+    if callable(close):
+        close()
+
+
+def _estimate_max_new_tokens(text: str, requested: int) -> int:
+    if os.getenv("QWEN3_TTS_DYNAMIC_MAX_NEW_TOKENS", "1") != "1":
+        return requested
+
+    text = text.strip()
+    char_count = len(text)
+    punctuation_count = sum(text.count(ch) for ch in ".!?;,")
+    token_base = int(os.getenv("QWEN3_TTS_TOKEN_BASE", "32"))
+    tokens_per_char = float(os.getenv("QWEN3_TTS_TOKENS_PER_CHAR", "1.10"))
+    punctuation_bonus = int(os.getenv("QWEN3_TTS_PUNCT_BONUS", "2"))
+    min_dynamic = int(os.getenv("QWEN3_TTS_MIN_DYNAMIC_MAX_NEW_TOKENS", "128"))
+
+    estimated = token_base + int(char_count * tokens_per_char) + punctuation_count * punctuation_bonus
+    return max(min_dynamic, min(requested, estimated))
 
 
 @app.on_event("startup")
@@ -124,30 +255,67 @@ async def load_model():
 
 @app.post("/synthesize")
 async def synthesize_stream(request: TTSRequest):
-    """
-    Stream audio chunks as Server-Sent Events (base64 PCM chunks).
-    """
-    started = time.perf_counter()
+    """Stream audio chunks as SSE events with base64 PCM."""
+    request_started = time.perf_counter()
+    audio_iter: Iterator[np.ndarray] | None = None
+    used_fallback = False
     try:
-        audio = engine.synthesize(
+        stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
             text=request.text, voice=request.voice, max_new_tokens=request.max_new_tokens
         )
+        first_audio = next(audio_iter, None)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if audio_iter is not None:
+            _close_iter_safely(audio_iter)
+        LOGGER.exception("TTS /synthesize primary stream failed")
+        try:
+            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
+                request.text,
+                request.voice,
+                request.max_new_tokens,
+            )
+            first_audio = fallback_audio
+            audio_iter = iter(())
+            used_fallback = True
+            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
+        except Exception as fallback_exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Primary stream failed: {exc}; fallback failed: {fallback_exc}",
+            ) from fallback_exc
 
-    ttfc_ms = (time.perf_counter() - started) * 1000.0
-    pcm = _audio_to_pcm16(audio)
+    if first_audio is None or first_audio.size == 0:
+        _close_iter_safely(audio_iter)
+        try:
+            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
+                request.text,
+                request.voice,
+                request.max_new_tokens,
+            )
+            first_audio = fallback_audio
+            audio_iter = iter(())
+            used_fallback = True
+            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
+        except Exception as fallback_exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model returned no audio and fallback failed: {fallback_exc}",
+            ) from fallback_exc
 
     def audio_generator():
         chunk_idx = 0
-        for chunk in _iter_pcm_chunks(pcm):
-            chunk_b64 = base64.b64encode(chunk).decode("utf-8")
+        for chunk in _iter_pcm_chunks_from_audio_stream(
+            _merged_audio_iter(first_audio, audio_iter)
+        ):
             event_data = {
                 "chunk_index": chunk_idx,
-                "audio_base64": chunk_b64,
+                "audio_base64": base64.b64encode(chunk).decode("utf-8"),
                 "sample_rate": SAMPLE_RATE,
                 "chunk_size_samples": CHUNK_SIZE,
-                "ttfc_ms": ttfc_ms if chunk_idx == 0 else None,
+                "ttfc_ms": stats.ttfc_ms if chunk_idx == 0 else None,
+                "rtf": None,
+                "max_new_tokens_effective": effective_max_new_tokens,
+                "streaming_mode": "fallback_pregen_stream" if used_fallback else "decode_time_codec_stream",
             }
             yield f"data: {json.dumps(event_data)}\n\n"
             chunk_idx += 1
@@ -162,30 +330,71 @@ async def synthesize_stream(request: TTSRequest):
 
 @app.post("/synthesize_binary")
 async def synthesize_stream_binary(request: TTSRequest):
-    """
-    Stream raw PCM audio chunks (16-bit mono @ 24kHz).
-    """
-    started = time.perf_counter()
+    """Stream raw PCM audio chunks (16-bit mono @ 24kHz)."""
+    request_started = time.perf_counter()
+    audio_iter: Iterator[np.ndarray] | None = None
+    used_fallback = False
     try:
-        audio = engine.synthesize(
+        stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
             text=request.text, voice=request.voice, max_new_tokens=request.max_new_tokens
         )
+        first_audio = next(audio_iter, None)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if audio_iter is not None:
+            _close_iter_safely(audio_iter)
+        LOGGER.exception("TTS /synthesize_binary primary stream failed")
+        try:
+            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
+                request.text,
+                request.voice,
+                request.max_new_tokens,
+            )
+            first_audio = fallback_audio
+            audio_iter = iter(())
+            used_fallback = True
+            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
+        except Exception as fallback_exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Primary stream failed: {exc}; fallback failed: {fallback_exc}",
+            ) from fallback_exc
 
-    ttfc_ms = (time.perf_counter() - started) * 1000.0
-    pcm = _audio_to_pcm16(audio)
+    if first_audio is None or first_audio.size == 0:
+        _close_iter_safely(audio_iter)
+        try:
+            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
+                request.text,
+                request.voice,
+                request.max_new_tokens,
+            )
+            first_audio = fallback_audio
+            audio_iter = iter(())
+            used_fallback = True
+            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
+        except Exception as fallback_exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Model returned no audio and fallback failed: {fallback_exc}",
+            ) from fallback_exc
 
-    def audio_generator():
-        for chunk in _iter_pcm_chunks(pcm):
-            yield chunk
+    ttfc_ms = stats.ttfc_ms
+    if ttfc_ms is None:
+        ttfc_ms = (time.perf_counter() - request_started) * 1000.0
 
     headers = {
         "Content-Type": "audio/pcm; rate=24000; channels=1; width=16",
         "Cache-Control": "no-cache",
         "X-TTFC-Ms": f"{ttfc_ms:.2f}",
+        "X-RTF": "na",
+        "X-Streaming-Mode": "fallback_pregen_stream" if used_fallback else "decode_time_codec_stream",
+        "X-Max-New-Tokens-Effective": str(effective_max_new_tokens),
+        "X-Decode-Stride": str(DECODE_STRIDE),
     }
-    return StreamingResponse(audio_generator(), media_type="audio/pcm", headers=headers)
+    return StreamingResponse(
+        _iter_pcm_chunks_from_audio_stream(_merged_audio_iter(first_audio, audio_iter)),
+        media_type="audio/pcm",
+        headers=headers,
+    )
 
 
 @app.get("/health")
@@ -194,7 +403,7 @@ async def health():
         "status": "healthy",
         "sample_rate": SAMPLE_RATE,
         "chunk_size_samples": CHUNK_SIZE,
-        "implementation": "qwen3-tts",
+        "implementation": "qwen3-tts-megakernel-talker",
         "model_loaded": engine.loaded,
         "model_name": engine.model_name,
         "device": str(engine._device),
@@ -209,7 +418,7 @@ async def spec():
         "sample_width_bytes": SAMPLE_WIDTH,
         "bytes_per_chunk": BYTES_PER_CHUNK,
         "format": "16-bit PCM, mono",
-        "status": "qwen3-tts inference",
+        "status": "talker megakernel + incremental codec decode",
         "default_voice": engine.default_voice,
     }
 
