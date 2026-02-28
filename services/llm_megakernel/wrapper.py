@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from typing import Iterator
 
 _KERNEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../kernel"))
@@ -23,10 +24,15 @@ class MegakernelDecoder:
         self._weights_loaded = False
         self._loaded_model_name: str | None = None
         self._lock = threading.Lock()
+        self._last_generation_metrics: dict[str, float | int] = {}
 
     @property
     def loaded_model_name(self) -> str | None:
         return self._loaded_model_name
+
+    @property
+    def last_generation_metrics(self) -> dict[str, float | int]:
+        return dict(self._last_generation_metrics)
 
     def _resolve_model_name(self, weights_path: str | None) -> str:
         if weights_path:
@@ -70,6 +76,12 @@ class MegakernelDecoder:
             Incremental text deltas as the model generates tokens.
         """
         if max_tokens <= 0:
+            self._last_generation_metrics = {
+                "token_steps": 0,
+                "emitted_chunks": 0,
+                "decode_s": 0.0,
+                "tok_per_s": 0.0,
+            }
             return
 
         if not self._weights_loaded:
@@ -89,8 +101,11 @@ class MegakernelDecoder:
 
             next_input = prompt_ids[-1]
             eos_id = self._tokenizer.eos_token_id
+            token_steps = 0
+            emitted_chunks = 0
+            started = time.perf_counter()
             generated_ids: list[int] = []
-            emitted_text = ""
+            decoded_so_far = ""
 
             for _ in range(max_tokens):
                 token_id = self._decoder.step(next_input)
@@ -98,14 +113,34 @@ class MegakernelDecoder:
                 if eos_id is not None and token_id == eos_id:
                     break
 
+                token_steps += 1
                 generated_ids.append(token_id)
-                decoded_text = self._tokenizer.decode(
-                    generated_ids, skip_special_tokens=True
+                decoded_now = self._tokenizer.decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
                 )
-                if decoded_text.startswith(emitted_text):
-                    delta = decoded_text[len(emitted_text) :]
+                # Decode incrementally from the cumulative token stream so
+                # streamed deltas match the final decoded text.
+                if decoded_now.startswith(decoded_so_far):
+                    delta = decoded_now[len(decoded_so_far) :]
                 else:
-                    delta = decoded_text
-                emitted_text = decoded_text
+                    # Rare tokenizer normalization edge case; fall back to
+                    # emitting the newly available decoded suffix.
+                    common = 0
+                    max_common = min(len(decoded_so_far), len(decoded_now))
+                    while common < max_common and decoded_so_far[common] == decoded_now[common]:
+                        common += 1
+                    delta = decoded_now[common:]
+                decoded_so_far = decoded_now
                 if delta:
+                    emitted_chunks += 1
                     yield delta
+
+            decode_s = max(time.perf_counter() - started, 1e-9)
+            self._last_generation_metrics = {
+                "token_steps": int(token_steps),
+                "emitted_chunks": int(emitted_chunks),
+                "decode_s": float(decode_s),
+                "tok_per_s": float(token_steps / decode_s),
+            }

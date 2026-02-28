@@ -42,16 +42,33 @@ async def generate_stream(request: GenerateRequest):
     
     def token_generator():
         """Generator that yields SSE-formatted token events."""
+        stream = None
         try:
-            for token in decoder.generate_stream(request.prompt, request.max_tokens):
+            stream = decoder.generate_stream(request.prompt, request.max_tokens)
+            for token in stream:
                 # Format as SSE: "data: <json>\n\n"
                 event_data = json.dumps({"token": token})
                 yield f"data: {event_data}\n\n"
             # Send completion event
-            yield f"data: {json.dumps({'done': True})}\n\n"
+            done_payload = {
+                "done": True,
+                "metrics": decoder.last_generation_metrics,
+            }
+            yield f"data: {json.dumps(done_payload)}\n\n"
+        except GeneratorExit:
+            raise
         except Exception as e:
             error_data = json.dumps({"error": str(e)})
-            yield f"data: {error_data}\n\n"
+            try:
+                yield f"data: {error_data}\n\n"
+            except Exception:
+                # Client likely disconnected mid-stream.
+                pass
+        finally:
+            if stream is not None:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
     
     return StreamingResponse(
         token_generator(),

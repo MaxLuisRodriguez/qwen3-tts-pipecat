@@ -222,6 +222,55 @@ def _close_iter_safely(audio_iter: Iterator[np.ndarray]) -> None:
         close()
 
 
+def _audio_rms(audio: np.ndarray) -> float:
+    if audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(audio.astype(np.float32, copy=False)))))
+
+
+def _is_effectively_silent(audio: np.ndarray, rms_threshold: float) -> bool:
+    if audio.size == 0:
+        return True
+    rms = _audio_rms(audio)
+    peak = float(np.max(np.abs(audio)))
+    return rms < rms_threshold and peak < (rms_threshold * 3.0)
+
+
+def _peek_audio_prefix(
+    audio_iter: Iterator[np.ndarray],
+    *,
+    max_chunks: int,
+    rms_threshold: float,
+) -> tuple[list[np.ndarray], bool]:
+    prefix: list[np.ndarray] = []
+    has_non_silent = False
+    for _ in range(max(1, max_chunks)):
+        chunk = next(audio_iter, None)
+        if chunk is None:
+            break
+        if chunk.size == 0:
+            continue
+        prefix.append(chunk)
+        if not _is_effectively_silent(chunk, rms_threshold):
+            has_non_silent = True
+            break
+    return prefix, has_non_silent
+
+
+def _prepend_audio_iter(
+    prefix: list[np.ndarray],
+    audio_iter: Iterator[np.ndarray],
+) -> Iterator[np.ndarray]:
+    try:
+        for chunk in prefix:
+            yield chunk
+        yield from audio_iter
+    finally:
+        close = getattr(audio_iter, "close", None)
+        if callable(close):
+            close()
+
+
 def _estimate_max_new_tokens(text: str, requested: int) -> int:
     if os.getenv("QWEN3_TTS_DYNAMIC_MAX_NEW_TOKENS", "1") != "1":
         return requested
@@ -229,13 +278,35 @@ def _estimate_max_new_tokens(text: str, requested: int) -> int:
     text = text.strip()
     char_count = len(text)
     punctuation_count = sum(text.count(ch) for ch in ".!?;,")
+    sentence_boundary_count = sum(text.count(ch) for ch in ".!?")
+    clause_separator_count = text.count(",") + text.count(";") + text.count(":")
     token_base = int(os.getenv("QWEN3_TTS_TOKEN_BASE", "32"))
     tokens_per_char = float(os.getenv("QWEN3_TTS_TOKENS_PER_CHAR", "1.10"))
     punctuation_bonus = int(os.getenv("QWEN3_TTS_PUNCT_BONUS", "2"))
     min_dynamic = int(os.getenv("QWEN3_TTS_MIN_DYNAMIC_MAX_NEW_TOKENS", "128"))
+    short_text_char_threshold = int(
+        os.getenv("QWEN3_TTS_SHORT_TEXT_CHAR_THRESHOLD", "48")
+    )
+    min_dynamic_short = int(os.getenv("QWEN3_TTS_MIN_DYNAMIC_MAX_NEW_TOKENS_SHORT", "28"))
+    tiny_text_char_threshold = int(
+        os.getenv("QWEN3_TTS_TINY_TEXT_CHAR_THRESHOLD", "12")
+    )
+    min_dynamic_tiny = int(os.getenv("QWEN3_TTS_MIN_DYNAMIC_MAX_NEW_TOKENS_TINY", "28"))
+    hard_min = int(os.getenv("QWEN3_TTS_HARD_MIN_EFFECTIVE_MAX_NEW_TOKENS", "16"))
+    clause_min = int(os.getenv("QWEN3_TTS_CLAUSE_MIN_EFFECTIVE_MAX_NEW_TOKENS", "64"))
 
     estimated = token_base + int(char_count * tokens_per_char) + punctuation_count * punctuation_bonus
-    return max(min_dynamic, min(requested, estimated))
+    min_floor = min_dynamic
+    if char_count <= short_text_char_threshold:
+        min_floor = min(min_floor, min_dynamic_short)
+    if char_count <= tiny_text_char_threshold:
+        min_floor = min(min_floor, min_dynamic_tiny)
+    if clause_separator_count > 0 or sentence_boundary_count > 1:
+        # Clause-heavy text needs a larger decode budget to avoid truncation.
+        min_floor = max(min_floor, clause_min)
+    min_floor = max(hard_min, min_floor)
+
+    return max(min_floor, min(requested, estimated))
 
 
 @app.on_event("startup")
@@ -256,9 +327,7 @@ async def load_model():
 @app.post("/synthesize")
 async def synthesize_stream(request: TTSRequest):
     """Stream audio chunks as SSE events with base64 PCM."""
-    request_started = time.perf_counter()
     audio_iter: Iterator[np.ndarray] | None = None
-    used_fallback = False
     try:
         stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
             text=request.text, voice=request.voice, max_new_tokens=request.max_new_tokens
@@ -268,39 +337,47 @@ async def synthesize_stream(request: TTSRequest):
         if audio_iter is not None:
             _close_iter_safely(audio_iter)
         LOGGER.exception("TTS /synthesize primary stream failed")
-        try:
-            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
-                request.text,
-                request.voice,
-                request.max_new_tokens,
-            )
-            first_audio = fallback_audio
-            audio_iter = iter(())
-            used_fallback = True
-            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
-        except Exception as fallback_exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Primary stream failed: {exc}; fallback failed: {fallback_exc}",
-            ) from fallback_exc
+        # Fallback intentionally disabled so output is always decode-time stream.
+        # try:
+        #     fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
+        #         request.text,
+        #         request.voice,
+        #         request.max_new_tokens,
+        #     )
+        #     first_audio = fallback_audio
+        #     audio_iter = iter(())
+        #     stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
+        # except Exception as fallback_exc:
+        #     raise HTTPException(
+        #         status_code=500,
+        #         detail=f"Primary stream failed: {exc}; fallback failed: {fallback_exc}",
+        #     ) from fallback_exc
+        raise HTTPException(
+            status_code=500,
+            detail=f"Primary decode-time stream failed (fallback disabled): {exc}",
+        ) from exc
 
     if first_audio is None or first_audio.size == 0:
         _close_iter_safely(audio_iter)
-        try:
-            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
-                request.text,
-                request.voice,
-                request.max_new_tokens,
-            )
-            first_audio = fallback_audio
-            audio_iter = iter(())
-            used_fallback = True
-            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
-        except Exception as fallback_exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Model returned no audio and fallback failed: {fallback_exc}",
-            ) from fallback_exc
+        # Fallback intentionally disabled so output is always decode-time stream.
+        # try:
+        #     fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
+        #         request.text,
+        #         request.voice,
+        #         request.max_new_tokens,
+        #     )
+        #     first_audio = fallback_audio
+        #     audio_iter = iter(())
+        #     stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
+        # except Exception as fallback_exc:
+        #     raise HTTPException(
+        #         status_code=500,
+        #         detail=f"Model returned no audio and fallback failed: {fallback_exc}",
+        #     ) from fallback_exc
+        raise HTTPException(
+            status_code=500,
+            detail="Model returned no audio from decode-time stream (fallback disabled).",
+        )
 
     def audio_generator():
         chunk_idx = 0
@@ -315,7 +392,7 @@ async def synthesize_stream(request: TTSRequest):
                 "ttfc_ms": stats.ttfc_ms if chunk_idx == 0 else None,
                 "rtf": None,
                 "max_new_tokens_effective": effective_max_new_tokens,
-                "streaming_mode": "fallback_pregen_stream" if used_fallback else "decode_time_codec_stream",
+                "streaming_mode": "decode_time_codec_stream",
             }
             yield f"data: {json.dumps(event_data)}\n\n"
             chunk_idx += 1
@@ -333,49 +410,71 @@ async def synthesize_stream_binary(request: TTSRequest):
     """Stream raw PCM audio chunks (16-bit mono @ 24kHz)."""
     request_started = time.perf_counter()
     audio_iter: Iterator[np.ndarray] | None = None
-    used_fallback = False
-    try:
-        stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
-            text=request.text, voice=request.voice, max_new_tokens=request.max_new_tokens
-        )
-        first_audio = next(audio_iter, None)
-    except Exception as exc:
-        if audio_iter is not None:
-            _close_iter_safely(audio_iter)
-        LOGGER.exception("TTS /synthesize_binary primary stream failed")
-        try:
-            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
-                request.text,
-                request.voice,
-                request.max_new_tokens,
-            )
-            first_audio = fallback_audio
-            audio_iter = iter(())
-            used_fallback = True
-            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
-        except Exception as fallback_exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Primary stream failed: {exc}; fallback failed: {fallback_exc}",
-            ) from fallback_exc
+    first_audio: np.ndarray | None = None
+    stats = None
+    effective_max_new_tokens = request.max_new_tokens
+    last_error: str | None = None
+    max_attempts = max(1, int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_MAX_ATTEMPTS", "2")))
+    retry_token_bump = int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_RETRY_TOKEN_BUMP", "24"))
+    non_silent_peek_chunks = int(os.getenv("QWEN3_TTS_NON_SILENT_PEEK_CHUNKS", "6"))
+    non_silent_rms = float(os.getenv("QWEN3_TTS_NON_SILENT_RMS", "0.0015"))
+    require_non_silent_prefix = os.getenv("QWEN3_TTS_REQUIRE_NON_SILENT_PREFIX", "0") == "1"
 
-    if first_audio is None or first_audio.size == 0:
-        _close_iter_safely(audio_iter)
+    for attempt in range(max_attempts):
+        attempt_max_new_tokens = min(8192, request.max_new_tokens + attempt * retry_token_bump)
         try:
-            fallback_audio, effective_max_new_tokens = engine.synthesize_fallback(
-                request.text,
-                request.voice,
-                request.max_new_tokens,
+            stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
+                text=request.text,
+                voice=request.voice,
+                max_new_tokens=attempt_max_new_tokens,
             )
-            first_audio = fallback_audio
-            audio_iter = iter(())
-            used_fallback = True
-            stats = type("Stats", (), {"ttfc_ms": (time.perf_counter() - request_started) * 1000.0})()
-        except Exception as fallback_exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Model returned no audio and fallback failed: {fallback_exc}",
-            ) from fallback_exc
+            prefix, has_non_silent = _peek_audio_prefix(
+                audio_iter,
+                max_chunks=non_silent_peek_chunks,
+                rms_threshold=non_silent_rms,
+            )
+            if not prefix:
+                _close_iter_safely(audio_iter)
+                audio_iter = None
+                last_error = "Model returned no audio chunks from decode-time stream."
+                continue
+
+            if has_non_silent:
+                while len(prefix) > 1 and _is_effectively_silent(prefix[0], non_silent_rms):
+                    prefix.pop(0)
+                first_audio = prefix[0]
+                audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
+                break
+
+            if require_non_silent_prefix:
+                _close_iter_safely(audio_iter)
+                audio_iter = None
+                last_error = "Leading decode-time audio chunks were effectively silent."
+                if attempt < max_attempts - 1:
+                    continue
+            else:
+                LOGGER.warning(
+                    "Leading decode-time chunks appear silent; streaming anyway (attempt %d/%d).",
+                    attempt + 1,
+                    max_attempts,
+                )
+                first_audio = prefix[0]
+                audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
+                break
+        except Exception as exc:
+            if audio_iter is not None:
+                _close_iter_safely(audio_iter)
+                audio_iter = None
+            last_error = f"Primary decode-time stream failed: {exc}"
+            if attempt < max_attempts - 1:
+                continue
+            LOGGER.exception("TTS /synthesize_binary primary stream failed")
+
+    if first_audio is None or audio_iter is None or stats is None:
+        raise HTTPException(
+            status_code=500,
+            detail=last_error or "Model returned no usable audio from decode-time stream.",
+        )
 
     ttfc_ms = stats.ttfc_ms
     if ttfc_ms is None:
@@ -386,7 +485,7 @@ async def synthesize_stream_binary(request: TTSRequest):
         "Cache-Control": "no-cache",
         "X-TTFC-Ms": f"{ttfc_ms:.2f}",
         "X-RTF": "na",
-        "X-Streaming-Mode": "fallback_pregen_stream" if used_fallback else "decode_time_codec_stream",
+        "X-Streaming-Mode": "decode_time_codec_stream",
         "X-Max-New-Tokens-Effective": str(effective_max_new_tokens),
         "X-Decode-Stride": str(DECODE_STRIDE),
     }
