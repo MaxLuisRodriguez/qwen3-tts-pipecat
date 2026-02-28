@@ -867,7 +867,8 @@ __device__ void ldg_o_proj_postnorm_mlp(
 __global__ void ldg_lm_head_phase1(const float *__restrict__ hidden,
                                    const __nv_bfloat16 *__restrict__ weight,
                                    float *__restrict__ block_max_vals,
-                                   int *__restrict__ block_max_idxs) {
+                                   int *__restrict__ block_max_idxs,
+                                   int vocab_size) {
   __shared__ __align__(16) float s_hidden[HIDDEN_SIZE];
 
   for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_LM_BLOCK_SIZE) {
@@ -878,9 +879,9 @@ __global__ void ldg_lm_head_phase1(const float *__restrict__ hidden,
   int warp_id = threadIdx.x / WARP_SIZE;
   int lane_id = threadIdx.x % WARP_SIZE;
 
-  int rows_per_block = (LDG_VOCAB_SIZE + gridDim.x - 1) / gridDim.x;
+  int rows_per_block = (vocab_size + gridDim.x - 1) / gridDim.x;
   int row_start = blockIdx.x * rows_per_block;
-  int row_end = min(row_start + rows_per_block, LDG_VOCAB_SIZE);
+  int row_end = min(row_start + rows_per_block, vocab_size);
 
   float local_max = -INFINITY;
   int local_max_idx = -1;
@@ -1023,7 +1024,8 @@ __global__ void ldg_lm_head_fused(const float *__restrict__ hidden,
                                   int *__restrict__ block_max_idxs,
                                   int *__restrict__ output_token,
                                   unsigned int *__restrict__ counter,
-                                  int num_blocks) {
+                                  int num_blocks,
+                                  int vocab_size) {
   __shared__ __align__(16) float s_hidden[HIDDEN_SIZE];
 
   for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_LM_BLOCK_SIZE) {
@@ -1034,9 +1036,9 @@ __global__ void ldg_lm_head_fused(const float *__restrict__ hidden,
   int warp_id = threadIdx.x / WARP_SIZE;
   int lane_id = threadIdx.x % WARP_SIZE;
 
-  int rows_per_block = (LDG_VOCAB_SIZE + gridDim.x - 1) / gridDim.x;
+  int rows_per_block = (vocab_size + gridDim.x - 1) / gridDim.x;
   int row_start = blockIdx.x * rows_per_block;
-  int row_end = min(row_start + rows_per_block, LDG_VOCAB_SIZE);
+  int row_end = min(row_start + rows_per_block, vocab_size);
 
   float local_max = -INFINITY;
   int local_max_idx = -1;
@@ -1311,6 +1313,7 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
 
 __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     const __nv_bfloat16 *__restrict__ embed_weight,
+    const __nv_bfloat16 *__restrict__ input_hidden,
     const LDGLayerWeights *__restrict__ layer_weights,
     const __nv_bfloat16 *__restrict__ final_norm_weight,
     const __nv_bfloat16 *__restrict__ cos_table,
@@ -1325,7 +1328,7 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     unsigned int *__restrict__ barrier_sense,
     unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
     int num_layers, int position, int input_token_id, int max_seq_len,
-    float attn_scale) {
+    float attn_scale, int use_input_hidden) {
   int cache_len = position + 1;
   int block_id = blockIdx.x;
   int num_blocks = gridDim.x;
@@ -1356,7 +1359,10 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
                       1};
 
-  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  const __nv_bfloat16 *embed_row = nullptr;
+  if (!use_input_hidden) {
+    embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  }
 
   int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
@@ -1365,7 +1371,9 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
     __nv_bfloat16 *layer_k_cache = k_cache + layer * kv_cache_layer_stride;
     __nv_bfloat16 *layer_v_cache = v_cache + layer * kv_cache_layer_stride;
 
-    const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
+    const __nv_bfloat16 *layer_input =
+        (layer == 0) ? (use_input_hidden ? input_hidden : embed_row)
+                     : hidden_buffer;
 
     ldg_matvec_qkv(grid, layer_input, w.input_layernorm_weight, w.q_proj_weight,
                    w.k_proj_weight, w.v_proj_weight, g_activations, g_residual,
@@ -1482,12 +1490,12 @@ extern "C" void launch_ldg_decode_direct(
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, int num_layers, int position, int max_seq_len,
-    float attn_scale, cudaStream_t stream) {
+    float attn_scale, int vocab_size, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
 
   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
-      (const __nv_bfloat16 *)embed_weight, layer_weights,
+      (const __nv_bfloat16 *)embed_weight, nullptr, layer_weights,
       (const __nv_bfloat16 *)final_norm_weight,
       (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
       (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
@@ -1495,13 +1503,43 @@ extern "C" void launch_ldg_decode_direct(
       (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
       (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
-      position, input_token_id, max_seq_len, attn_scale);
+      position, input_token_id, max_seq_len, attn_scale, 0);
 
   cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
   ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
       (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
       (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
-      d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+      d_lm_head_counter, LDG_LM_NUM_BLOCKS, vocab_size);
+}
+
+extern "C" void launch_ldg_decode_from_hidden_direct(
+    const void *input_hidden, int *output_token_id,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int position, int max_seq_len,
+    float attn_scale, int vocab_size, cudaStream_t stream) {
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+
+  ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+      nullptr, (const __nv_bfloat16 *)input_hidden, layer_weights,
+      (const __nv_bfloat16 *)final_norm_weight,
+      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
+      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
+      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
+      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      position, 0, max_seq_len, attn_scale, 1);
+
+  cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
+  ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
+      (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
+      d_lm_head_counter, LDG_LM_NUM_BLOCKS, vocab_size);
 }
 
 extern "C" void launch_ldg_decode_persistent(
@@ -1512,7 +1550,7 @@ extern "C" void launch_ldg_decode_persistent(
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, int num_layers, int position, int cache_len,
-    int max_seq_len, float attn_scale, cudaStream_t stream) {
+    int max_seq_len, float attn_scale, int vocab_size, cudaStream_t stream) {
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
 
@@ -1539,7 +1577,7 @@ extern "C" void launch_ldg_decode_persistent(
   ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
       (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
       (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
-      d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+      d_lm_head_counter, LDG_LM_NUM_BLOCKS, vocab_size);
 }
 
 // N-step generate with NO per-step CPU sync. All steps queued back-to-back.
@@ -1554,7 +1592,7 @@ extern "C" void launch_ldg_generate_nosync(
     void *block_max_idxs,
     int *output_log, // device int[num_steps]: all generated tokens
     int num_layers, int start_position, int max_seq_len, float attn_scale,
-    cudaStream_t stream) {
+    int vocab_size, cudaStream_t stream) {
 
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
@@ -1595,7 +1633,7 @@ extern "C" void launch_ldg_generate_nosync(
     ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
         (float *)block_max_vals, (int *)block_max_idxs, d_output_token,
-        d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+        d_lm_head_counter, LDG_LM_NUM_BLOCKS, vocab_size);
 
     // Update step: feed output token back, increment position, log result
     ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,

@@ -40,7 +40,7 @@ extern "C" void launch_ldg_decode_persistent(
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, int num_layers, int position, int cache_len,
-    int max_seq_len, float attn_scale, cudaStream_t stream);
+    int max_seq_len, float attn_scale, int vocab_size, cudaStream_t stream);
 
 extern "C" void launch_ldg_decode_direct(
     int input_token_id, int *output_token_id, const void *embed_weight,
@@ -50,7 +50,17 @@ extern "C" void launch_ldg_decode_direct(
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, int num_layers, int position, int max_seq_len,
-    float attn_scale, cudaStream_t stream);
+    float attn_scale, int vocab_size, cudaStream_t stream);
+
+extern "C" void launch_ldg_decode_from_hidden_direct(
+    const void *input_hidden, int *output_token_id,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int position, int max_seq_len,
+    float attn_scale, int vocab_size, cudaStream_t stream);
 
 void decode(torch::Tensor output_token, int64_t input_token_id,
             torch::Tensor embed_weight, torch::Tensor layer_weights_packed,
@@ -77,6 +87,34 @@ void decode(torch::Tensor output_token, int64_t input_token_id,
       block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
       static_cast<int>(num_layers), static_cast<int>(position),
       static_cast<int>(max_seq_len), static_cast<float>(attn_scale),
+      static_cast<int>(lm_head_weight.size(0)),
+      c10::cuda::getCurrentCUDAStream().stream());
+}
+
+void decode_from_hidden(
+    torch::Tensor output_token, torch::Tensor input_hidden,
+    torch::Tensor layer_weights_packed, torch::Tensor final_norm_weight,
+    torch::Tensor lm_head_weight, torch::Tensor cos_table,
+    torch::Tensor sin_table, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor hidden_buffer, torch::Tensor activations,
+    torch::Tensor residual, torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor attn_out, torch::Tensor mlp_intermediate,
+    torch::Tensor normalized, torch::Tensor block_max_vals,
+    torch::Tensor block_max_idxs, int64_t num_layers, int64_t position,
+    int64_t max_seq_len, double attn_scale) {
+  launch_ldg_decode_from_hidden_direct(
+      input_hidden.data_ptr(), static_cast<int *>(output_token.data_ptr()),
+      reinterpret_cast<const LDGLayerWeights *>(
+          layer_weights_packed.data_ptr()),
+      final_norm_weight.data_ptr(), lm_head_weight.data_ptr(),
+      cos_table.data_ptr(), sin_table.data_ptr(), k_cache.data_ptr(),
+      v_cache.data_ptr(), hidden_buffer.data_ptr(), activations.data_ptr(),
+      residual.data_ptr(), q.data_ptr(), k.data_ptr(), v.data_ptr(),
+      attn_out.data_ptr(), mlp_intermediate.data_ptr(), normalized.data_ptr(),
+      block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
+      static_cast<int>(num_layers), static_cast<int>(position),
+      static_cast<int>(max_seq_len), static_cast<float>(attn_scale),
+      static_cast<int>(lm_head_weight.size(0)),
       c10::cuda::getCurrentCUDAStream().stream());
 }
 
@@ -88,7 +126,7 @@ extern "C" void launch_ldg_generate_nosync(
     void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
     void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
     void *block_max_idxs, int *output_log, int num_layers, int start_position,
-    int max_seq_len, float attn_scale, cudaStream_t stream);
+    int max_seq_len, float attn_scale, int vocab_size, cudaStream_t stream);
 
 torch::Tensor generate_nosync(
     int64_t first_token_id, int64_t num_steps, torch::Tensor embed_weight,
@@ -119,7 +157,8 @@ torch::Tensor generate_nosync(
       block_max_vals.data_ptr(), block_max_idxs.data_ptr(),
       static_cast<int *>(output_log.data_ptr()), static_cast<int>(num_layers),
       static_cast<int>(start_position), static_cast<int>(max_seq_len),
-      static_cast<float>(attn_scale), stream);
+      static_cast<float>(attn_scale), static_cast<int>(lm_head_weight.size(0)),
+      stream);
 
   // Single sync at end -- all N steps already queued
   cudaStreamSynchronize(stream);
@@ -139,6 +178,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "int num_layers, int position, int max_seq_len, "
           "float attn_scale) -> ()");
   ops.impl("decode", torch::kCUDA, &decode);
+
+  ops.def("decode_from_hidden(Tensor output_token, Tensor input_hidden, "
+          "Tensor layer_weights_packed, Tensor final_norm_weight, "
+          "Tensor lm_head_weight, Tensor cos_table, Tensor sin_table, "
+          "Tensor k_cache, Tensor v_cache, "
+          "Tensor hidden_buffer, Tensor activations, Tensor residual, "
+          "Tensor q, Tensor k, Tensor v, Tensor attn_out, "
+          "Tensor mlp_intermediate, Tensor normalized, "
+          "Tensor block_max_vals, Tensor block_max_idxs, "
+          "int num_layers, int position, int max_seq_len, "
+          "float attn_scale) -> ()");
+  ops.impl("decode_from_hidden", torch::kCUDA, &decode_from_hidden);
 
   ops.def("generate_nosync(int first_token_id, int num_steps, "
           "Tensor embed_weight, Tensor layer_weights_packed, "

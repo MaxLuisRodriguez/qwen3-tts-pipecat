@@ -30,10 +30,16 @@ Server runs on `http://localhost:8001`.
 
 - `QWEN3_TTS_MODEL_NAME` (default: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`)
 - `QWEN3_TTS_DEFAULT_VOICE` (default: `vivian`)
-- `QWEN3_TTS_ATTN_IMPL` (default: `sdpa`)
+- `QWEN3_TTS_ATTN_IMPL` (default: `flash_attention_2`, auto-falls back to `sdpa` if unavailable)
 - `QWEN3_TTS_SAMPLE_RATE` (default: `24000`)
 - `QWEN3_TTS_CHUNK_SIZE` (default: `1600`)
 - `TTS_PRELOAD_MODEL` (`1` to load at startup, default `0`)
+- `QWEN3_TTS_ADAPTIVE_DECODE_CADENCE` (`1` to decode frame 1 first, then stride adaptively)
+- `QWEN3_TTS_DECODE_STRIDE_MID` (default: `2`)
+- `QWEN3_TTS_DECODE_STRIDE_LATE` (default: `4`)
+- `QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME` (default: `24`)
+- `QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES` (default: `25`)
+- `QWEN3_TTS_SUBTALKER_MODE` (`manual` default, `generate` for legacy HF generate path)
 
 For `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, valid speakers include:
 `serena`, `vivian`, `uncle_fu`, `ryan`, `aiden`, `ono_anna`, `sohee`, `eric`, `dylan`.
