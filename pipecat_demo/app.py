@@ -52,6 +52,9 @@ class MegakernelLLMClient:
         )
         self._history: list[tuple[str, str]] = []
         self._max_history_turns = int(os.getenv("PIPECAT_MAX_HISTORY_TURNS", "6"))
+        self._response_first_line_only = os.getenv("PIPECAT_RESPONSE_FIRST_LINE_ONLY", "1") == "1"
+        self._response_first_sentence_only = os.getenv("PIPECAT_RESPONSE_FIRST_SENTENCE_ONLY", "1") == "1"
+        self._response_max_chars = int(os.getenv("PIPECAT_RESPONSE_MAX_CHARS", "120"))
 
     def _build_prompt(self, user_text: str) -> str:
         turns = self._history[-self._max_history_turns :]
@@ -101,15 +104,18 @@ class MegakernelLLMClient:
             parts.append(chunk)
 
         response = "".join(parts).strip()
-        # Megakernel decode can drift into repeated multi-line patterns; keep
-        # only the first concise sentence for low-latency voice playback.
+        # Keep voice output short and stable for lower TTS latency.
         response = response.replace("\r", "")
-        first_line = response.splitlines()[0].strip() if response else ""
-        if first_line:
-            response = first_line
-        if ". " in response:
-            response = response.split(". ", 1)[0].strip() + "."
-        response = response[:160].strip()
+        if self._response_first_line_only:
+            first_line = response.splitlines()[0].strip() if response else ""
+            if first_line:
+                response = first_line
+        if self._response_first_sentence_only and response:
+            for i, ch in enumerate(response):
+                if ch in ".?!":
+                    response = response[: i + 1].strip()
+                    break
+        response = response[: self._response_max_chars].strip()
         if not response:
             response = "I did not catch that. Could you repeat it?"
 
@@ -127,7 +133,7 @@ class LocalQwenTTSService(TTSService):
         aiohttp_session: aiohttp.ClientSession,
         base_url: str,
         voice: str | None = None,
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = 256,
         in_sample_rate: int = 24000,
         **kwargs,
     ):
@@ -137,16 +143,32 @@ class LocalQwenTTSService(TTSService):
         self._voice = voice
         self._max_new_tokens = max_new_tokens
         self._in_sample_rate = in_sample_rate
+        self._dynamic_max_new_tokens = os.getenv("PIPECAT_TTS_DYNAMIC_MAX_NEW_TOKENS", "1") == "1"
+        self._tts_token_base = int(os.getenv("PIPECAT_TTS_TOKEN_BASE", "32"))
+        self._tts_tokens_per_char = float(os.getenv("PIPECAT_TTS_TOKENS_PER_CHAR", "0.75"))
+        self._tts_punct_bonus = int(os.getenv("PIPECAT_TTS_PUNCT_BONUS", "2"))
+        self._tts_min_new_tokens = int(os.getenv("PIPECAT_TTS_MIN_NEW_TOKENS", "80"))
 
     def can_generate_metrics(self) -> bool:
         return True
 
+    def _estimate_max_new_tokens(self, text: str) -> int:
+        if not self._dynamic_max_new_tokens:
+            return self._max_new_tokens
+
+        stripped = text.strip()
+        punct = sum(stripped.count(ch) for ch in ".!?;,")
+        estimate = self._tts_token_base + int(len(stripped) * self._tts_tokens_per_char)
+        estimate += punct * self._tts_punct_bonus
+        return max(self._tts_min_new_tokens, min(self._max_new_tokens, estimate))
+
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        effective_max_new_tokens = self._estimate_max_new_tokens(text)
         payload = {
             "text": text,
             "voice": self._voice,
-            "max_new_tokens": self._max_new_tokens,
+            "max_new_tokens": effective_max_new_tokens,
         }
         headers = {"Content-Type": "application/json"}
 
@@ -244,7 +266,7 @@ async def main():
     tts_service_url = os.getenv("TTS_SERVICE_URL", "http://localhost:8001")
     qwen_tts_voice = os.getenv("QWEN3_TTS_VOICE", os.getenv("QWEN3_TTS_DEFAULT_VOICE", "vivian"))
     qwen_tts_sample_rate = int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
-    qwen_tts_max_new_tokens = int(os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", "1024"))
+    qwen_tts_max_new_tokens = int(os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", "256"))
 
     daily_session = await _resolve_daily_session()
     print(f"[pipecat] Join this Daily room: {daily_session.room_url}")
