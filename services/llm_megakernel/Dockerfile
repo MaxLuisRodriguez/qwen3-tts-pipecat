@@ -8,14 +8,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY services/llm_megakernel/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Copy service code
-COPY . .
+# Preserve repo layout so relative paths in the service continue to resolve.
+COPY services/llm_megakernel /app/services/llm_megakernel
+COPY kernel /app/kernel
 
-# Copy kernel directory (for imports)
-COPY ../../kernel /app/kernel
+WORKDIR /app/services/llm_megakernel
 
 # Expose port
 EXPOSE 8000

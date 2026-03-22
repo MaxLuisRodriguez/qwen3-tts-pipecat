@@ -8,11 +8,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pipecat_demo/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Copy demo code
-COPY . .
+# Preserve repo layout so the app's repo-root env lookup remains valid.
+COPY pipecat_demo /app/pipecat_demo
+
+WORKDIR /app/pipecat_demo
 
 # Set environment variables (can be overridden)
 ENV LLM_SERVICE_URL=http://llm-service:8000

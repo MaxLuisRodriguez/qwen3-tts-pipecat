@@ -3,10 +3,13 @@ version: '3.8'
 services:
   llm-service:
     build:
-      context: ./services/llm_megakernel
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/llm_megakernel/Dockerfile
     ports:
       - "8000:8000"
+    env_file:
+      - path: ./.env.qwen_megakernel
+        required: false
     environment:
       - PYTHONUNBUFFERED=1
     # GPU passthrough (requires NVIDIA Container Toolkit)
@@ -31,10 +34,15 @@ services:
 
   tts-service:
     build:
-      context: ./services/tts_qwen3
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/tts_qwen3/Dockerfile
     ports:
       - "8001:8001"
+    env_file:
+      - path: ./.env.qwen_megakernel
+        required: false
+      - path: ./.env.pipecat
+        required: false
     environment:
       - PYTHONUNBUFFERED=1
     # GPU passthrough for TTS model (when integrated)
@@ -45,6 +53,8 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    volumes:
+      - ./kernel:/app/kernel:ro
     networks:
       - megakernel-net
     healthcheck:
@@ -55,11 +65,16 @@ services:
 
   pipecat-demo:
     build:
-      context: ./pipecat_demo
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: pipecat_demo/Dockerfile
     depends_on:
       - llm-service
       - tts-service
+    env_file:
+      - path: ./.env.qwen_megakernel
+        required: false
+      - path: ./.env.pipecat
+        required: false
     environment:
       - LLM_SERVICE_URL=http://llm-service:8000
       - TTS_SERVICE_URL=http://tts-service:8001

@@ -31,6 +31,11 @@ class TalkerMegakernelBackend:
         self._qwen = qwen_tts_model
         self._model = qwen_tts_model.model
         self._talker = self._model.talker
+        self._subtalker = self._talker.code_predictor
+        self._subtalker_model = self._subtalker.model
+        self._subtalker_input_embeddings = self._subtalker.get_input_embeddings()
+        self._subtalker_output_heads = self._subtalker.lm_head
+        self._subtalker_projection = self._subtalker.small_to_mtp_projection
         self._device = self._talker.device
         self._dtype = self._talker.dtype
         self._head_dim = int(
@@ -43,6 +48,8 @@ class TalkerMegakernelBackend:
         self._attn_scale = 1.0 / math.sqrt(self._head_dim)
 
         self._num_layers = int(self._talker.config.num_hidden_layers)
+        self._num_code_groups = int(self._talker.config.num_code_groups)
+        self._num_subtalker_steps = self._num_code_groups - 1
         self._num_kv_heads = int(self._talker.config.num_key_value_heads)
         self._hidden_size = int(self._talker.config.hidden_size)
         self._intermediate = int(self._talker.config.intermediate_size)
@@ -201,6 +208,109 @@ class TalkerMegakernelBackend:
             raise RuntimeError(f"speech_tokenizer.decode failed: {errors[-1]}")
         return np.empty((0,), dtype=np.float32), int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
 
+    @staticmethod
+    def _sample_subtalker_token(
+        logits: torch.Tensor,
+        *,
+        do_sample: bool,
+        top_p: float,
+        top_k: int,
+        temperature: float,
+    ) -> torch.Tensor:
+        if logits.dim() != 2 or logits.shape[0] != 1:
+            raise ValueError(f"Expected logits shape [1, vocab], got {tuple(logits.shape)}")
+
+        flat_logits = logits[0]
+        if not do_sample or temperature <= 0.0:
+            return torch.argmax(flat_logits, dim=-1, keepdim=True)
+
+        work_logits = flat_logits.float()
+        if temperature != 1.0:
+            work_logits = work_logits / max(temperature, 1e-5)
+
+        candidate_indices = torch.arange(work_logits.shape[0], device=work_logits.device)
+        if 0 < top_k < work_logits.shape[0]:
+            work_logits, candidate_indices = torch.topk(work_logits, k=top_k)
+
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_order = torch.sort(work_logits, descending=True)
+            sorted_indices = candidate_indices[sorted_order]
+            probs = torch.softmax(sorted_logits, dim=-1)
+            keep_mask = probs.cumsum(dim=-1) <= top_p
+            keep_mask[0] = True
+            filtered_logits = sorted_logits.masked_fill(~keep_mask, float("-inf"))
+            filtered_probs = torch.softmax(filtered_logits, dim=-1)
+            sampled_sorted = torch.multinomial(filtered_probs, num_samples=1)
+            return sorted_indices[sampled_sorted]
+
+        probs = torch.softmax(work_logits, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1)
+        return candidate_indices[sampled]
+
+    def _predict_subtalker_frame(
+        self,
+        *,
+        first_token: torch.Tensor,
+        first_hidden: torch.Tensor,
+        past_hidden: torch.Tensor,
+        do_sample: bool,
+        top_p: float,
+        top_k: int,
+        temperature: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Custom fixed-shape decode for the code predictor.
+
+        This replaces the generic HF `generate()` loop with a cache-reusing
+        path specialized to Qwen3-TTS's fixed `num_code_groups - 1` decode.
+        """
+        frame_codes = torch.empty(self._num_code_groups, dtype=torch.long, device=self._device)
+        frame_codes[0] = first_token.view(-1)[0]
+        codec_sum = first_hidden.clone()
+
+        outputs = self._subtalker_model(
+            input_ids=None,
+            inputs_embeds=self._subtalker_projection(torch.cat((past_hidden, first_hidden), dim=1)),
+            past_key_values=None,
+            use_cache=True,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        kv_cache = outputs.past_key_values
+        hidden = outputs.last_hidden_state[:, -1, :]
+
+        for group_idx in range(self._num_subtalker_steps):
+            logits = self._subtalker_output_heads[group_idx](hidden)
+            next_token = self._sample_subtalker_token(
+                logits,
+                do_sample=do_sample,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+            )
+            frame_codes[group_idx + 1] = next_token[0]
+
+            next_embed = self._subtalker_input_embeddings[group_idx](next_token.view(1, 1))
+            codec_sum = codec_sum + next_embed
+
+            if group_idx + 1 >= self._num_subtalker_steps:
+                break
+
+            outputs = self._subtalker_model(
+                input_ids=None,
+                inputs_embeds=self._subtalker_projection(next_embed),
+                past_key_values=kv_cache,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            kv_cache = outputs.past_key_values
+            hidden = outputs.last_hidden_state[:, -1, :]
+
+        return frame_codes, codec_sum
+
     def stream_audio(
         self,
         text: str,
@@ -227,161 +337,150 @@ class TalkerMegakernelBackend:
             top_k = int(os.getenv("QWEN3_TTS_SUBTALKER_TOP_K", "40"))
             temperature = float(os.getenv("QWEN3_TTS_SUBTALKER_TEMPERATURE", "0.8"))
 
-            self._reset_runtime()
-            started = torch.cuda.Event(enable_timing=True)
-            ended = torch.cuda.Event(enable_timing=True)
-            started.record()
+            with torch.inference_mode():
+                self._reset_runtime()
+                started = torch.cuda.Event(enable_timing=True)
+                ended = torch.cuda.Event(enable_timing=True)
+                started.record()
 
-            talker_input_embed, trailing_text_hidden, tts_pad_embed = self._build_custom_voice_prompt(
-                text,
-                speaker,
-                language=language,
-            )
-            attn_mask = torch.ones(
-                (talker_input_embed.shape[0], talker_input_embed.shape[1]), dtype=torch.long, device=self._device
-            )
-            prefill = self._talker(
-                inputs_embeds=talker_input_embed,
-                attention_mask=attn_mask,
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
+                talker_input_embed, trailing_text_hidden, tts_pad_embed = self._build_custom_voice_prompt(
+                    text,
+                    speaker,
+                    language=language,
+                )
+                attn_mask = torch.ones(
+                    (talker_input_embed.shape[0], talker_input_embed.shape[1]), dtype=torch.long, device=self._device
+                )
+                prefill = self._talker(
+                    inputs_embeds=talker_input_embed,
+                    attention_mask=attn_mask,
+                    use_cache=True,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
 
-            next_first = torch.argmax(prefill.logits[:, -1, :], dim=-1).to(torch.long)
-            seq_len = int(talker_input_embed.shape[1])
-            self._copy_prefill_cache(prefill.past_key_values, seq_len)
-            past_hidden = prefill.past_hidden
-            generation_step = int(prefill.generation_step)
-            talker_cfg = self._model.config.talker_config
-            eos_id = int(talker_cfg.codec_eos_token_id)
-            bos_id = int(talker_cfg.codec_bos_id)
+                next_first = torch.argmax(prefill.logits[:, -1, :], dim=-1).to(torch.long)
+                seq_len = int(talker_input_embed.shape[1])
+                self._copy_prefill_cache(prefill.past_key_values, seq_len)
+                past_hidden = prefill.past_hidden
+                generation_step = int(prefill.generation_step)
+                talker_cfg = self._model.config.talker_config
+                eos_id = int(talker_cfg.codec_eos_token_id)
+                bos_id = int(talker_cfg.codec_bos_id)
 
-            emitted_samples = 0
-            trailing_silence_samples = 0
-            frames: list[torch.Tensor] = []
-            for step in range(max_new_tokens):
-                next_token = int(next_first.item())
-                if next_token == eos_id:
-                    if step < min_eos_steps:
-                        # Avoid pathological immediate-eos streams that produce no audio.
-                        next_token = bos_id
+                emitted_samples = 0
+                trailing_silence_samples = 0
+                frames: list[torch.Tensor] = []
+                for step in range(max_new_tokens):
+                    next_token = int(next_first.item())
+                    if next_token == eos_id:
+                        if step < min_eos_steps:
+                            # Avoid pathological immediate-eos streams that produce no audio.
+                            next_token = bos_id
+                        else:
+                            break
+
+                    next_first = torch.tensor([next_token], device=self._device, dtype=torch.long)
+                    first_hidden = self._talker.get_input_embeddings()(next_first.unsqueeze(0))
+                    frame_codes, codec_sum = self._predict_subtalker_frame(
+                        first_token=next_first,
+                        first_hidden=first_hidden,
+                        past_hidden=past_hidden,
+                        do_sample=do_sample,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                    )
+                    frames.append(frame_codes)
+
+                    input_embed = codec_sum
+                    if generation_step < trailing_text_hidden.shape[1]:
+                        input_embed = input_embed + trailing_text_hidden[:, generation_step].unsqueeze(1)
                     else:
-                        break
+                        input_embed = input_embed + tts_pad_embed
 
-                next_first = torch.tensor([next_token], device=self._device, dtype=torch.long)
-                first_hidden = self._talker.get_input_embeddings()(next_first.unsqueeze(0))
-                predictor = self._talker.code_predictor.generate(
-                    inputs_embeds=torch.cat((past_hidden, first_hidden), dim=1),
-                    max_new_tokens=self._talker.config.num_code_groups - 1,
-                    do_sample=do_sample,
-                    top_p=top_p,
-                    top_k=top_k,
-                    temperature=temperature,
-                    output_hidden_states=False,
-                    return_dict_in_generate=True,
-                )
-                frame_codes = torch.cat((next_first.unsqueeze(0), predictor.sequences), dim=-1)[0]
-                frames.append(frame_codes)
+                    self._decode_from_hidden(
+                        self._out_token,
+                        input_embed[0, 0].to(torch.bfloat16).contiguous(),
+                        self._layer_weights_packed,
+                        self._final_norm_weight,
+                        self._lm_head_weight,
+                        self._cos_table,
+                        self._sin_table,
+                        self._k_cache,
+                        self._v_cache,
+                        self._hidden,
+                        self._act,
+                        self._res,
+                        self._q,
+                        self._k,
+                        self._v,
+                        self._attn_out,
+                        self._mlp_inter,
+                        self._norm_out,
+                        self._bmax_vals,
+                        self._bmax_idxs,
+                        self._num_layers,
+                        seq_len + step,
+                        self._max_seq_len,
+                        self._attn_scale,
+                    )
 
-                codec_hiddens = torch.cat(
-                    [first_hidden]
-                    + [
-                        self._talker.code_predictor.get_input_embeddings()[i](
-                            predictor.sequences[..., i : i + 1]
-                        )
-                        for i in range(self._talker.config.num_code_groups - 1)
-                    ],
-                    dim=1,
-                )
-                input_embed = codec_hiddens.sum(1, keepdim=True)
-                if generation_step < trailing_text_hidden.shape[1]:
-                    input_embed = input_embed + trailing_text_hidden[:, generation_step].unsqueeze(1)
-                else:
-                    input_embed = input_embed + tts_pad_embed
+                    next_first = self._out_token.to(torch.long)
+                    past_hidden = self._norm_out.view(1, 1, -1).to(self._dtype)
+                    generation_step += 1
 
-                self._decode_from_hidden(
-                    self._out_token,
-                    input_embed[0, 0].to(torch.bfloat16).contiguous(),
-                    self._layer_weights_packed,
-                    self._final_norm_weight,
-                    self._lm_head_weight,
-                    self._cos_table,
-                    self._sin_table,
-                    self._k_cache,
-                    self._v_cache,
-                    self._hidden,
-                    self._act,
-                    self._res,
-                    self._q,
-                    self._k,
-                    self._v,
-                    self._attn_out,
-                    self._mlp_inter,
-                    self._norm_out,
-                    self._bmax_vals,
-                    self._bmax_idxs,
-                    self._num_layers,
-                    seq_len + step,
-                    self._max_seq_len,
-                    self._attn_scale,
-                )
+                    should_decode = False
+                    n_frames = len(frames)
+                    if n_frames <= first_chunk_frames:
+                        should_decode = True
+                    elif ((n_frames - first_chunk_frames) % effective_decode_stride) == 0:
+                        should_decode = True
 
-                next_first = self._out_token.to(torch.long)
-                past_hidden = self._norm_out.view(1, 1, -1).to(self._dtype)
-                generation_step += 1
+                    if should_decode:
+                        audio_codes = torch.stack(frames, dim=0)
+                        wav, sr = self._decode_audio_codes(audio_codes)
+                        if wav.shape[0] > emitted_samples:
+                            delta = wav[emitted_samples:]
+                            emitted_samples = wav.shape[0]
+                            stats.frames_generated = len(frames)
+                            if stats.ttfc_ms is None:
+                                ended.record()
+                                torch.cuda.synchronize()
+                                stats.ttfc_ms = float(started.elapsed_time(ended))
+                            yield delta
 
-                should_decode = False
-                n_frames = len(frames)
-                if n_frames <= first_chunk_frames:
-                    should_decode = True
-                elif ((n_frames - first_chunk_frames) % effective_decode_stride) == 0:
-                    should_decode = True
+                            if silence_early_stop and n_frames >= min_frames_before_silence_stop:
+                                silent = np.abs(delta) <= silence_rms
+                                silent_tail = 0
+                                for sample_is_silent in silent[::-1]:
+                                    if sample_is_silent:
+                                        silent_tail += 1
+                                    else:
+                                        break
+                                if silent_tail == delta.shape[0]:
+                                    trailing_silence_samples += silent_tail
+                                else:
+                                    trailing_silence_samples = silent_tail
 
-                if should_decode:
+                                if trailing_silence_samples >= int(silence_tail_s * sr):
+                                    break
+
+                if frames:
                     audio_codes = torch.stack(frames, dim=0)
                     wav, sr = self._decode_audio_codes(audio_codes)
                     if wav.shape[0] > emitted_samples:
                         delta = wav[emitted_samples:]
                         emitted_samples = wav.shape[0]
-                        stats.frames_generated = len(frames)
                         if stats.ttfc_ms is None:
                             ended.record()
                             torch.cuda.synchronize()
                             stats.ttfc_ms = float(started.elapsed_time(ended))
                         yield delta
+                    stats.audio_seconds = float(wav.shape[0]) / float(sr)
 
-                        if silence_early_stop and n_frames >= min_frames_before_silence_stop:
-                            silent = np.abs(delta) <= silence_rms
-                            silent_tail = 0
-                            for sample_is_silent in silent[::-1]:
-                                if sample_is_silent:
-                                    silent_tail += 1
-                                else:
-                                    break
-                            if silent_tail == delta.shape[0]:
-                                trailing_silence_samples += silent_tail
-                            else:
-                                trailing_silence_samples = silent_tail
-
-                            if trailing_silence_samples >= int(silence_tail_s * sr):
-                                break
-
-            if frames:
-                audio_codes = torch.stack(frames, dim=0)
-                wav, sr = self._decode_audio_codes(audio_codes)
-                if wav.shape[0] > emitted_samples:
-                    delta = wav[emitted_samples:]
-                    emitted_samples = wav.shape[0]
-                    if stats.ttfc_ms is None:
-                        ended.record()
-                        torch.cuda.synchronize()
-                        stats.ttfc_ms = float(started.elapsed_time(ended))
-                    yield delta
-                stats.audio_seconds = float(wav.shape[0]) / float(sr)
-
-            ended.record()
-            torch.cuda.synchronize()
-            stats.generation_s = float(started.elapsed_time(ended)) / 1000.0
+                ended.record()
+                torch.cuda.synchronize()
+                stats.generation_s = float(started.elapsed_time(ended)) / 1000.0
 
         return stats, _run()

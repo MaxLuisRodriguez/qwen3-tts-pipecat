@@ -8,11 +8,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY services/tts_qwen3/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Copy service code
-COPY . .
+# Preserve repo layout so relative paths in the service continue to resolve.
+COPY services/tts_qwen3 /app/services/tts_qwen3
+COPY kernel /app/kernel
+
+WORKDIR /app/services/tts_qwen3
 
 # Expose port
 EXPOSE 8001
