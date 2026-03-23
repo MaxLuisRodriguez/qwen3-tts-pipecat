@@ -65,8 +65,6 @@ No external TTS fallback was added to make the bot appear better than the local 
 - [scripts/run_local.sh](/root/qwen3-tts-pipecat/scripts/run_local.sh): one-command local demo
 - [scripts/benchmark_stack.py](/root/qwen3-tts-pipecat/scripts/benchmark_stack.py): service-level benchmark
 - [scripts/benchmark_roundtrip.py](/root/qwen3-tts-pipecat/scripts/benchmark_roundtrip.py): parses Pipecat turn metrics
-- [scripts/quick_bench_once.sh](/root/qwen3-tts-pipecat/scripts/quick_bench_once.sh): one-shot local benchmark
-- [scripts/quick_bench_sweep.sh](/root/qwen3-tts-pipecat/scripts/quick_bench_sweep.sh): short/medium/long benchmark sweep
 
 ## Setup
 
@@ -106,19 +104,22 @@ When the terminal prints the Daily room URL, join from a browser and speak.
 ### Service-level quick check
 
 ```bash
-bash scripts/quick_bench_once.sh
-```
-
-### Sweep
-
-```bash
-bash scripts/quick_bench_sweep.sh
+kernel/.venv/bin/python scripts/benchmark_stack.py \
+  --llm-url http://127.0.0.1:8000 \
+  --tts-url http://127.0.0.1:8001 \
+  --llm-prompt "Answer in one short sentence: what can you do?" \
+  --tts-text "This is a short benchmark utterance." \
+  --tts-max-new-tokens 48 \
+  --tts-read-chunk-bytes 960 \
+  --json
 ```
 
 ### End-to-end Pipecat turn parsing
 
 ```bash
-bash scripts/quick_bench_roundtrip.sh
+kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
+  --log-file /path/to/run_local.log \
+  --timeout-s 120
 ```
 
 ## Current Best-Known Measurements
@@ -161,7 +162,6 @@ This is why the repo can feel smooth in short conversations while still missing 
 
 - The take-home prompt asked for one informative README: this file is intended to be that document.
 - The original prompt is preserved in [project_instructions.md](/root/qwen3-tts-pipecat/project_instructions.md).
-- Additional measurement notes are in [README_BENCHMARK_NOTES.md](/root/qwen3-tts-pipecat/README_BENCHMARK_NOTES.md).
 
 ## References
 
