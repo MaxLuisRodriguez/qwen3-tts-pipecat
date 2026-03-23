@@ -12,6 +12,7 @@ The take-home prompt that guided this work is preserved in [project_instructions
 - Local Qwen3-TTS talker service on `:8001`
 - Daily Pipecat room bot with streamed PCM audio
 - Decode-time audio streaming to Pipecat without full-utterance buffering
+- Binary TTS path now pushes chunks to Pipecat immediately as they are decoded
 - End-to-end voice turns with live terminal metrics
 
 The pipeline is now stable enough for normal short voice turns. The main remaining gap is performance: TTFC and especially RTF are still above the stretch targets from the prompt.
@@ -34,6 +35,7 @@ Important kernel-side changes:
 
 - hidden-state decode entrypoint for talker continuation
 - hidden-only decode path so the next codec token can be chosen from the correct normalized hidden state
+- fused `decode_hidden_fp32_head` path so talker continuation keeps the correct fp32 LM-head token selection while removing one host-side step per token
 - reuse of the original fused decode kernel structure instead of rewriting the architecture
 
 ### 3. Kept streaming decode-time audio
@@ -42,6 +44,7 @@ The TTS service still streams PCM while the utterance is being generated:
 
 - no full-waveform fallback path is used in the active pipeline
 - Pipecat consumes the HTTP stream incrementally
+- `/synthesize_binary` no longer front-buffers a non-silent prefix before returning the streaming response
 - the speech tokenizer decode is stateful/incremental within a request
 
 ### 4. Hardened short-turn stability without changing providers
@@ -122,30 +125,37 @@ kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
   --timeout-s 120
 ```
 
-## Current Best-Known Measurements
+## Current Measurements
 
-These are the latest service-level numbers from this repo after the final audit, using the tuned decode cadence and benchmark streaming read size:
+These are the current representative numbers for the code on `main`. They are intentionally reported as measured, not idealized:
 
-- Short case:
-  - `header_ttfc_ms ~= 162.6`
-  - `tts_rtf ~= 1.48`
-- Medium case:
-  - `header_ttfc_ms ~= 165.1`
-  - `tts_rtf ~= 1.08`
-- Long case:
-  - `header_ttfc_ms ~= 117.0`
-  - `tts_rtf ~= 3.92`
-
-Sweep artifact:
-
-- [/tmp/qwen_bench_sweep_20260323_043310/summary.json](/tmp/qwen_bench_sweep_20260323_043310/summary.json)
+- Megakernel text decode smoke benchmark on the RTX 5090:
+  - about `1043 tok/s`
+- Representative warm local talker/TTS backend run:
+  - text: `the city is tehran`
+  - `ttfc_ms ~= 114.6`
+  - `generation_s ~= 4.686`
+  - `audio_s ~= 5.120`
+  - `rtf ~= 0.915`
+- Representative cold short-utterance run:
+  - text: `ready`
+  - `ttfc_ms ~= 731.0`
+  - `generation_s ~= 2.153`
+  - `audio_s ~= 1.520`
+  - `rtf ~= 1.416`
+- Last captured live Pipecat round-trip turn:
+  - `overall_ms ~= 5193.4`
+  - `llm_tok_s ~= 296.7`
+  - `ttfc_ms ~= 171.5`
+  - `rtf ~= 0.970`
+  - `audio_s ~= 4.560`
 
 Interpretation:
 
-- The local LLM side is no longer the main blocker.
-- The remaining performance miss is mostly on the talker/audio side.
-- TTFC is still well above the prompt target, though stable enough for a demo.
-- RTF remains far above target, especially on longer utterances.
+- The local LLM decode path is no longer the main bottleneck.
+- Warm TTS is materially better than the earlier audit numbers that were in this README before the latest fixes.
+- Cold start is still much slower than warm steady-state.
+- TTFC and RTF are improved enough for a smooth demo, but they still miss the take-home stretch targets.
 
 ## Why The Targets Are Still Missed
 
@@ -157,6 +167,19 @@ The repo now has a stable and honest local stack, but the remaining bottlenecks 
 4. Long-form talker generation is much less efficient than the raw Qwen3 megakernel text decode path.
 
 This is why the repo can feel smooth in short conversations while still missing the take-home RTF target in formal measurement.
+
+## Deliverables Mapping
+
+- Working repo with build instructions:
+  - covered by the `Setup` section and [scripts/bootstrap_qwen_megakernel.sh](/root/qwen3-tts-pipecat/scripts/bootstrap_qwen_megakernel.sh)
+- Short README with architecture decisions, kernel modifications, and how to run the demo:
+  - this file
+- Performance numbers:
+  - reported in `Current Measurements`
+- End-to-end latency and streaming confirmation:
+  - reported via the live Pipecat metric lines and [scripts/benchmark_roundtrip.py](/root/qwen3-tts-pipecat/scripts/benchmark_roundtrip.py)
+- Demo recording:
+  - not stored in the repo; attach separately as an out-of-repo submission artifact
 
 ## Submission Notes
 
