@@ -464,7 +464,7 @@ class LocalQwenTTSService(TTSService):
             os.getenv("PIPECAT_TTS_MIN_NEW_TOKENS_TINY", "16")
         )
         self._tts_api_min_new_tokens = int(
-            os.getenv("PIPECAT_TTS_API_MIN_NEW_TOKENS", "64")
+            os.getenv("PIPECAT_TTS_API_MIN_NEW_TOKENS", "48")
         )
         self._tts_sentence_min_new_tokens = int(
             os.getenv("PIPECAT_TTS_SENTENCE_MIN_NEW_TOKENS", "160")

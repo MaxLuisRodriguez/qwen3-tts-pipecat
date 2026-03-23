@@ -39,8 +39,8 @@ DECODE_STRIDE = int(os.getenv("QWEN3_TTS_DECODE_STRIDE", "1"))
 
 def _decode_stride_header_value() -> str:
     if os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1":
-        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "8")))
-        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "16")))
+        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "12")))
+        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "24")))
         late_start = int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24"))
         left_context = max(0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "12")))
         return f"adaptive(mid={mid},late={late}@{late_start},ctx={left_context})"
@@ -55,7 +55,7 @@ class TTSRequest(BaseModel):
         default=None, description="Optional speaker label (e.g. Cherry)."
     )
     max_new_tokens: int = Field(
-        default=1024, ge=64, le=8192, description="Max decode tokens for TTS generation."
+        default=1024, ge=32, le=8192, description="Max decode tokens for TTS generation."
     )
 
 
@@ -278,21 +278,42 @@ def _peek_audio_prefix(
     audio_iter: Iterator[np.ndarray],
     *,
     max_chunks: int,
+    max_prefix_samples: int,
     rms_threshold: float,
 ) -> tuple[list[np.ndarray], bool]:
     prefix: list[np.ndarray] = []
     has_non_silent = False
-    for _ in range(max(1, max_chunks)):
+    total_samples = 0
+    min_chunks = max(1, max_chunks)
+    hard_max_samples = max(0, max_prefix_samples)
+    while True:
+        if len(prefix) >= min_chunks and (has_non_silent or (hard_max_samples > 0 and total_samples >= hard_max_samples)):
+            break
+        if hard_max_samples == 0 and len(prefix) >= min_chunks:
+            break
         chunk = next(audio_iter, None)
         if chunk is None:
             break
         if chunk.size == 0:
             continue
         prefix.append(chunk)
+        total_samples += int(chunk.shape[0])
         if not _is_effectively_silent(chunk, rms_threshold):
             has_non_silent = True
-            break
     return prefix, has_non_silent
+
+
+def _trim_leading_silence(audio: np.ndarray, rms_threshold: float) -> np.ndarray:
+    if audio.size == 0:
+        return audio
+    amplitude_threshold = max(float(rms_threshold) * 2.5, 0.0025)
+    voiced = np.flatnonzero(np.abs(audio.astype(np.float32, copy=False)) >= amplitude_threshold)
+    if voiced.size == 0:
+        return audio
+    start = int(voiced[0])
+    if start <= 0:
+        return audio
+    return audio[start:].copy()
 
 
 def _prepend_audio_iter(
@@ -549,6 +570,10 @@ async def synthesize_stream_binary(request: TTSRequest):
     strict_non_silent_peek_chunks = int(
         os.getenv("QWEN3_TTS_STRICT_NON_SILENT_PEEK_CHUNKS", "12")
     )
+    max_prefix_silence_s = float(os.getenv("QWEN3_TTS_MAX_PREFIX_SILENCE_S", "0.8"))
+    strict_max_prefix_silence_s = float(
+        os.getenv("QWEN3_TTS_STRICT_MAX_PREFIX_SILENCE_S", "1.6")
+    )
     non_silent_rms = float(os.getenv("QWEN3_TTS_NON_SILENT_RMS", "0.0015"))
     require_non_silent_prefix = os.getenv("QWEN3_TTS_REQUIRE_NON_SILENT_PREFIX", "0") == "1"
     candidate_texts = _speech_stabilization_candidates(request.text)
@@ -564,8 +589,13 @@ async def synthesize_stream_binary(request: TTSRequest):
                     max_new_tokens=attempt_max_new_tokens,
                 )
                 peek_chunks = non_silent_peek_chunks
+                max_prefix_samples = int(max_prefix_silence_s * SAMPLE_RATE)
                 if _prefers_strict_prefix_probe(candidate_text) or candidate_index > 0:
                     peek_chunks = max(peek_chunks, strict_non_silent_peek_chunks)
+                    max_prefix_samples = max(
+                        max_prefix_samples,
+                        int(strict_max_prefix_silence_s * SAMPLE_RATE),
+                    )
 
                 if peek_chunks <= 0:
                     first_audio = next(audio_iter, None)
@@ -581,6 +611,7 @@ async def synthesize_stream_binary(request: TTSRequest):
                 prefix, has_non_silent = _peek_audio_prefix(
                     audio_iter,
                     max_chunks=peek_chunks,
+                    max_prefix_samples=max_prefix_samples,
                     rms_threshold=non_silent_rms,
                 )
                 if not prefix:
@@ -592,7 +623,10 @@ async def synthesize_stream_binary(request: TTSRequest):
                 if has_non_silent:
                     while len(prefix) > 1 and _is_effectively_silent(prefix[0], non_silent_rms):
                         prefix.pop(0)
-                    first_audio = prefix[0]
+                    first_audio = _trim_leading_silence(prefix[0], non_silent_rms)
+                    if first_audio.size == 0 and len(prefix) > 1:
+                        prefix.pop(0)
+                        first_audio = prefix[0]
                     audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
                     selected_text = candidate_text
                     selected_candidate_index = candidate_index
@@ -639,8 +673,13 @@ async def synthesize_stream_binary(request: TTSRequest):
                     max_new_tokens=attempt_max_new_tokens,
                 )
                 peek_chunks = non_silent_peek_chunks
+                max_prefix_samples = int(max_prefix_silence_s * SAMPLE_RATE)
                 if _prefers_strict_prefix_probe(candidate_text):
                     peek_chunks = max(peek_chunks, strict_non_silent_peek_chunks)
+                    max_prefix_samples = max(
+                        max_prefix_samples,
+                        int(strict_max_prefix_silence_s * SAMPLE_RATE),
+                    )
 
                 if peek_chunks <= 0:
                     first_audio = next(audio_iter, None)
@@ -648,10 +687,14 @@ async def synthesize_stream_binary(request: TTSRequest):
                     prefix, _ = _peek_audio_prefix(
                         audio_iter,
                         max_chunks=peek_chunks,
+                        max_prefix_samples=max_prefix_samples,
                         rms_threshold=non_silent_rms,
                     )
                     if prefix:
-                        first_audio = prefix[0]
+                        first_audio = _trim_leading_silence(prefix[0], non_silent_rms)
+                        if first_audio.size == 0 and len(prefix) > 1:
+                            prefix.pop(0)
+                            first_audio = prefix[0]
                         audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
                 if first_audio is not None and first_audio.size > 0:
                     selected_text = candidate_text
