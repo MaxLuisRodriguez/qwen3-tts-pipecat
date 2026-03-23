@@ -15,7 +15,8 @@ The take-home prompt that guided this work is preserved in [project_instructions
 - Binary TTS path now pushes chunks to Pipecat immediately as they are decoded
 - End-to-end voice turns with live terminal metrics
 
-The pipeline is now stable enough for normal short voice turns. The main remaining gap is performance: TTFC and RTF are still above stretch targets.
+The pipeline is now stable for short voice interactions. 
+The primary remaining limitation is performance: TTFC and RTF remain above the stretch targets.
 
 ## Key Integration Decisions
 
@@ -56,7 +57,7 @@ The repo now includes:
 - candidate-based speech stabilization inside the same local backend
 - warmup/preload support for the first turn
 
-No external TTS fallback was added to make the bot appear better than the local stack really is.
+No external TTS fallback was introduced; all results reflect the performance of the local stack.
 
 ## Repo Layout
 
@@ -277,8 +278,8 @@ rtf = tts_stream_s / audio_s
 
 Interpretation:
 
-- The local LLM decode path is no longer the main bottleneck.
-- Warm TTS is materially better than the earlier audit numbers that were in this README before the latest fixes.
+- The local LLM decode path is no longer the dominant bottleneck.  
+- Warm-state TTS performance has improved significantly compared to earlier versions.
 - Cold start is still much slower than warm steady-state.
 - TTFC and RTF are improved enough for a smooth demo, but they still miss the take-home stretch targets.
 
@@ -291,7 +292,7 @@ The repo now has a stable and honest local stack, but the remaining bottlenecks 
 3. Some short-turn reliability logic still trades latency for robustness.
 4. Long-form talker generation is much less efficient than the raw Qwen3 megakernel text decode path.
 
-This is why the repo can feel smooth in short conversations while still missing the take-home RTF target in formal measurement.
+This explains why the system feels smooth during short interactions while still missing the take-home RTF target under formal measurement.
 
 ## Deliverables Mapping
 
