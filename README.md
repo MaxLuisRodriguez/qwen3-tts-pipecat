@@ -125,6 +125,86 @@ kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
   --timeout-s 120
 ```
 
+### Exact backend measurement command used for the README numbers
+
+This command measures the local talker backend directly, without Daily or HTTP transport in the loop:
+
+```bash
+cd /root/qwen3-tts-pipecat
+set -a
+source .env.qwen_megakernel
+[ -f .env.pipecat ] && source .env.pipecat || true
+set +a
+export PYTHONPATH="/root/qwen3-tts-pipecat/kernel"
+export PATH="/root/qwen3-tts-pipecat/kernel/.venv/bin:/venv/qwen-live-chatbot/bin:$PATH"
+./kernel/.venv/bin/python - <<'PY'
+import numpy as np
+import torch
+from qwen_tts import Qwen3TTSModel
+from services.tts_qwen3.megakernel_talker import TalkerMegakernelBackend
+
+model = Qwen3TTSModel.from_pretrained(
+    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    device_map="cuda:0",
+    dtype=torch.bfloat16,
+    attn_implementation="sdpa",
+)
+model.model.eval()
+backend = TalkerMegakernelBackend(model)
+
+for text in ["ready", "the city is tehran"]:
+    stats, audio_iter = backend.stream_audio(
+        text=text,
+        speaker="vivian",
+        language="english",
+        max_new_tokens=64,
+    )
+    sample_count = 0
+    chunk_count = 0
+    for chunk in audio_iter:
+        arr = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        sample_count += arr.size
+        chunk_count += 1
+    rtf = (stats.generation_s / stats.audio_seconds) if stats.audio_seconds else None
+    print(
+        {
+            "text": text,
+            "chunks": chunk_count,
+            "sample_count": sample_count,
+            "ttfc_ms": stats.ttfc_ms,
+            "audio_s": stats.audio_seconds,
+            "generation_s": stats.generation_s,
+            "rtf": rtf,
+            "stop_reason": stats.stop_reason,
+        }
+    )
+PY
+```
+
+### Exact live Pipecat measurement flow
+
+1. Start the stack:
+
+```bash
+START_TTS_SERVICE=1 bash scripts/run_local.sh
+```
+
+2. Join the printed Daily room URL and do one short voice turn.
+
+3. Read the terminal lines printed by [pipecat_demo/app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py):
+
+- `[metrics][roundtrip]`
+- `[metrics][stream]`
+- `[metrics][quality]`
+
+4. Or parse a saved log file with:
+
+```bash
+kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
+  --log-file /path/to/run_local.log \
+  --timeout-s 120
+```
+
 ## Current Measurements
 
 These are the current representative numbers for the code on `main`. They are intentionally reported as measured, not idealized:
@@ -149,6 +229,51 @@ These are the current representative numbers for the code on `main`. They are in
   - `ttfc_ms ~= 171.5`
   - `rtf ~= 0.970`
   - `audio_s ~= 4.560`
+
+## How TTFC And RTF Were Calculated
+
+### Direct backend TTS numbers
+
+The warm and cold local TTS numbers in `Current Measurements` were computed from the backend stats object returned by [megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py#L653).
+
+- `ttfc_ms`
+  - recorded when the first non-empty decoded audio chunk is yielded
+  - set in [megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py#L872) or the final flush path at [megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py#L919)
+- `generation_s`
+  - total CUDA-event elapsed generation time
+  - set in [megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py#L928)
+- `audio_s`
+  - total emitted audio duration in seconds
+  - set in [megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py#L924)
+- `rtf`
+  - calculated as:
+
+```text
+rtf = generation_s / audio_s
+```
+
+### Live Pipecat turn numbers
+
+The live round-trip numbers come from [pipecat_demo/app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py).
+
+- `ttfc_ms`
+  - taken from the TTS response header when present, otherwise from observed first chunk arrival
+  - see [app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py#L915) and [app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py#L987)
+- `audio_s`
+  - calculated from streamed PCM bytes:
+
+```text
+audio_s = raw_bytes / (sample_rate * 2)
+```
+
+- `rtf`
+  - calculated as:
+
+```text
+rtf = tts_stream_s / audio_s
+```
+
+  - see [app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py#L983) and [app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py#L988)
 
 Interpretation:
 
