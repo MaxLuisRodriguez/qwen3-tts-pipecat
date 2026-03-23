@@ -16,6 +16,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 KERNEL_DIR="${REPO_ROOT}/kernel"
 ENV_FILE="${REPO_ROOT}/.env.qwen_megakernel"
 ENV_TEMPLATE="${REPO_ROOT}/.env.qwen_megakernel.template"
+RUNTIME_CONSTRAINTS="${REPO_ROOT}/constraints/runtime-cu128.txt"
 SMOKE_LOG="${REPO_ROOT}/smoke_test.log"
 EXPECTED_MODEL_SHA256="f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
 
@@ -202,18 +203,24 @@ setup_python_env() {
   cd "${KERNEL_DIR}"
 
   if [[ ! -d ".venv" ]]; then
-    retry uv venv .venv || fail "Failed to create virtual environment with uv."
+    retry uv venv --seed .venv || fail "Failed to create virtual environment with uv."
   fi
 
   # shellcheck disable=SC1091
   source .venv/bin/activate
 
+  if ! python -m pip --version >/dev/null 2>&1; then
+    retry python -m ensurepip --upgrade || fail "Failed to seed pip into virtual environment."
+  fi
+
   retry python -m pip install --upgrade pip || fail "Failed to upgrade pip."
-  retry pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128 || fail "Failed to install torch cu128 wheel."
-  retry pip install "transformers>=4.51.0" triton accelerate ninja huggingface_hub || fail "Failed to install Python dependencies."
-  retry pip install -r "${REPO_ROOT}/services/llm_megakernel/requirements.txt" || fail "Failed to install llm service dependencies."
-  retry pip install -r "${REPO_ROOT}/services/tts_qwen3/requirements.txt" || fail "Failed to install tts service dependencies."
-  retry pip install -r "${REPO_ROOT}/pipecat_demo/requirements.txt" || fail "Failed to install pipecat dependencies."
+  retry pip install --index-url https://download.pytorch.org/whl/cu128 \
+    torch==2.7.0+cu128 torchaudio==2.7.0+cu128 || fail "Failed to install pinned torch/torchaudio cu128 wheels."
+  retry pip install -c "${RUNTIME_CONSTRAINTS}" \
+    transformers==4.57.3 triton==3.3.0 accelerate==1.12.0 ninja huggingface_hub || fail "Failed to install pinned Python dependencies."
+  retry pip install -c "${RUNTIME_CONSTRAINTS}" -r "${REPO_ROOT}/services/llm_megakernel/requirements.txt" || fail "Failed to install llm service dependencies."
+  retry pip install -c "${RUNTIME_CONSTRAINTS}" -r "${REPO_ROOT}/services/tts_qwen3/requirements.txt" || fail "Failed to install tts service dependencies."
+  retry pip install -c "${RUNTIME_CONSTRAINTS}" -r "${REPO_ROOT}/pipecat_demo/requirements.txt" || fail "Failed to install pipecat dependencies."
 }
 
 verify_torch_gpu() {

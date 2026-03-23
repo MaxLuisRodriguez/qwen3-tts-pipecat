@@ -19,8 +19,10 @@ It is designed around the take-home scope:
 - `pipecat_demo/`: voice bot app for Daily room conversation
 - `scripts/bootstrap_qwen_megakernel.sh`: environment + extension bootstrap
 - `scripts/run_local.sh`: start local stack + Pipecat demo
-- `scripts/benchmark_stack.py`: benchmark client used by quick scripts
-- `scripts/quick_bench_once.sh`: one-shot benchmark runner
+- `scripts/benchmark_stack.py`: service-level LLM/TTS benchmark client
+- `scripts/benchmark_roundtrip.py`: Pipecat end-to-end turn metric parser
+- `scripts/quick_bench_once.sh`: one-shot service-level benchmark runner
+- `scripts/quick_bench_roundtrip.sh`: one-shot Pipecat round-trip benchmark runner
 - `scripts/quick_bench_sweep.sh`: short/medium/long benchmark sweep
 
 ## Requirements
@@ -44,6 +46,7 @@ bash scripts/bootstrap_qwen_megakernel.sh
 Notes:
 
 - Bootstrap creates `kernel/.venv`, installs deps, resolves model weights, and JIT-builds the extension.
+- Bootstrap seeds `pip` explicitly and pins the validated `torch` / `torchaudio` / `triton` runtime baseline for RTX 5090 + `cu128`.
 - Keep `QWEN_MEGAKERNEL_MODEL_NAME` set to the intended Qwen backbone in `.env.qwen_megakernel`.
 
 ## Configure Runtime
@@ -98,7 +101,7 @@ Stop with `Ctrl+C` in the terminal running `run_local.sh`.
 
 ## Quick Benchmark Scripts
 
-### 1) Single quick benchmark
+### 1) Single quick service benchmark
 
 ```bash
 bash scripts/quick_bench_once.sh
@@ -109,6 +112,7 @@ Behavior:
 - Uses running services if healthy
 - Otherwise starts local LLM/TTS services temporarily
 - Runs `scripts/benchmark_stack.py` and saves JSON to `/tmp/qwen_bench_once_<timestamp>.json`
+- Reports service-level timings only; it does not claim STT/Daily/browser end-to-end latency
 
 Useful env overrides:
 
@@ -120,7 +124,29 @@ BENCH_TIMEOUT_S=600 \
 bash scripts/quick_bench_once.sh
 ```
 
-### 2) Multi-case sweep (short/medium/long)
+### 2) End-to-end Pipecat round-trip benchmark
+
+```bash
+bash scripts/quick_bench_roundtrip.sh
+```
+
+Behavior:
+
+- Starts `scripts/run_local.sh` into a log file unless `START_STACK=0`
+- Prints the Daily room URL
+- Waits for one complete spoken turn and parses the emitted:
+  - `[metrics][roundtrip]`
+  - `[metrics][stream]`
+  - `[metrics][quality]`
+- Saves JSON to `/tmp/qwen_roundtrip_<timestamp>.json`
+
+Keep the stack up after the first captured turn:
+
+```bash
+KEEP_STACK_RUNNING=1 bash scripts/quick_bench_roundtrip.sh
+```
+
+### 3) Multi-case sweep (short/medium/long)
 
 ```bash
 bash scripts/quick_bench_sweep.sh
@@ -140,21 +166,31 @@ BENCH_SWEEP_OUT_DIR=/tmp/my_bench_sweep bash scripts/quick_bench_sweep.sh
 
 ## Metrics and Measurement Definitions
 
-Implemented in `scripts/benchmark_stack.py`:
+Service-level metrics from `scripts/benchmark_stack.py`:
 
 - `llm.decode_tok_s = token_count / (t_end - t_first_token)`
 - `tts.first_chunk_ms = (t_first_chunk - t_request_start) * 1000`
 - `tts.audio_s = bytes_received / (24000 * 2)`
 - `tts.rtf = tts_total_seconds / tts.audio_s`
-- `e2e_estimate_ms = llm.ttft_ms + tts.first_chunk_ms`
+- `service_pipeline_estimate_ms = llm.ttft_ms + tts.first_chunk_ms`
 
 Backend TTS also exposes `X-TTFC-Ms`, measured server-side and returned in benchmark output as `header_ttfc_ms`.
+
+End-to-end turn metrics from `scripts/benchmark_roundtrip.py`:
+
+- `overall_ms`
+- `llm_tok_s`
+- `ttfc_ms`
+- `rtf`
+- `mode`
+- `frame_by_frame`
+- `audio_ok`
 
 ## Deliverables Mapping
 
 - Working build/run flow on one machine: yes (bootstrap + run_local)
 - Architecture/kernels documented: yes (this README + source files)
-- Quick benchmark methodology and scripts: yes (`quick_bench_once.sh`, `quick_bench_sweep.sh`)
+- Quick benchmark methodology and scripts: yes (`quick_bench_once.sh`, `quick_bench_roundtrip.sh`, `quick_bench_sweep.sh`)
 - Short engineering note: see `README_BENCHMARK_NOTES.md`
 
 ## References

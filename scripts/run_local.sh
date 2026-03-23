@@ -34,6 +34,7 @@ if [ ! -x "$PYTHON_BIN" ]; then
     exit 1
 fi
 export PATH="$KERNEL_VENV/bin:$PATH"
+export PYTHONUNBUFFERED=1
 echo -e "${GREEN}Using Python: $PYTHON_BIN${NC}"
 
 # Load shared runtime config if present.
@@ -128,7 +129,7 @@ check_port() {
 if check_port 8000; then
     echo -e "${GREEN}Starting LLM service on port 8000...${NC}"
     cd services/llm_megakernel
-    "$PYTHON_BIN" server.py &
+    "$PYTHON_BIN" -u server.py &
     LLM_PID=$!
     cd "$REPO_ROOT"
     echo "LLM service PID: $LLM_PID"
@@ -143,7 +144,7 @@ sleep 2
 if [ "$START_TTS_SERVICE" = "1" ] && check_port 8001; then
     echo -e "${GREEN}Starting TTS service on port 8001...${NC}"
     cd services/tts_qwen3
-    "$PYTHON_BIN" server.py &
+    "$PYTHON_BIN" -u server.py &
     TTS_PID=$!
     cd "$REPO_ROOT"
     echo "TTS service PID: $TTS_PID"
@@ -182,7 +183,7 @@ fi
 # Run the demo
 echo -e "${GREEN}Running Pipecat demo...${NC}"
 cd pipecat_demo
-"$PYTHON_BIN" app.py &
+"$PYTHON_BIN" -u app.py &
 APP_PID=$!
 
 # Wait for demo to finish

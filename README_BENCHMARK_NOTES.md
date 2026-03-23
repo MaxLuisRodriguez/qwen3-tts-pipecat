@@ -28,7 +28,7 @@
 
 ## How Benchmark Accuracy Is Established
 
-Three independent timing views are captured:
+Four timing views are captured:
 
 1. Client-observed streaming timings:
    - from `scripts/benchmark_stack.py` wall-clock at request, first chunk/token, and completion.
@@ -36,6 +36,8 @@ Three independent timing views are captured:
    - `X-TTFC-Ms` response header from TTS service, measured server-side.
 3. Byte-derived audio duration:
    - computed as `bytes / (sample_rate * bytes_per_sample)` to avoid assumptions.
+4. Pipecat round-trip turn metrics:
+   - parsed from the existing `[metrics][roundtrip]`, `[metrics][stream]`, and `[metrics][quality]` lines emitted by `pipecat_demo/app.py`.
 
 Consistency checks:
 
@@ -56,11 +58,16 @@ TTS:
 - `audio_s = bytes_received / (24000 * 2)` for 24kHz mono int16 PCM
 - `rtf = (t_request_end - t_request_start) / audio_s`
 
-End-to-end estimate (service-level):
+Service-only additive estimate:
 
-- `e2e_estimate_ms = llm.ttft_ms + tts.first_chunk_ms`
+- `service_pipeline_estimate_ms = llm.ttft_ms + tts.first_chunk_ms`
 
 This estimate intentionally excludes STT and Daily network/browser playback variability.
+
+Actual end-to-end turn metrics:
+
+- `overall_ms`, `llm_tok_s`, `ttfc_ms`, and `rtf` are emitted by the Pipecat app after a completed voice turn.
+- `scripts/benchmark_roundtrip.py` waits for and parses those log lines into JSON.
 
 ## How to Reproduce Quickly
 
@@ -70,6 +77,12 @@ Single run:
 bash scripts/quick_bench_once.sh
 ```
 
+Single end-to-end turn:
+
+```bash
+bash scripts/quick_bench_roundtrip.sh
+```
+
 Sweep:
 
 ```bash
@@ -77,4 +90,3 @@ bash scripts/quick_bench_sweep.sh
 ```
 
 Each script writes JSON artifacts to `/tmp` by default for auditable reruns.
-

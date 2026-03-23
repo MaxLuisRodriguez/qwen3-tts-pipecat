@@ -40,3 +40,12 @@ Thumbs.db
 *.bin
 *.safetensors
 .ref/
+
+# Local caches / build artifacts
+.hf_home/
+.torch_extensions/
+services/**/.hf_home/
+services/**/.torch_extensions/
+kernel/weights/
+smoke_test.log
+=4.57.0

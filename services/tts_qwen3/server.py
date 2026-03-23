@@ -37,6 +37,16 @@ BYTES_PER_CHUNK = CHUNK_SIZE * SAMPLE_WIDTH
 DECODE_STRIDE = int(os.getenv("QWEN3_TTS_DECODE_STRIDE", "1"))
 
 
+def _decode_stride_header_value() -> str:
+    if os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1":
+        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "2")))
+        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "4")))
+        late_start = int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24"))
+        left_context = max(0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "25")))
+        return f"adaptive(mid={mid},late={late}@{late_start},ctx={left_context})"
+    return str(DECODE_STRIDE)
+
+
 class TTSRequest(BaseModel):
     """Request model for text-to-speech."""
 
@@ -178,6 +188,34 @@ class Qwen3TTSEngine:
 engine = Qwen3TTSEngine()
 
 
+def _warmup_tts_engine() -> None:
+    if os.getenv("TTS_WARMUP_ON_STARTUP", "0") != "1":
+        return
+    warmup_text = os.getenv("TTS_WARMUP_TEXT", "I am here.").strip()
+    if not warmup_text:
+        return
+
+    audio_iter: Iterator[np.ndarray] | None = None
+    try:
+        stats, audio_iter, _ = engine.stream_synthesize(
+            text=warmup_text,
+            voice=engine.default_voice,
+            max_new_tokens=128,
+        )
+        first_audio = next(audio_iter, None)
+        LOGGER.info(
+            "TTS warmup completed: text=%r ttfc_ms=%s first_audio_samples=%s",
+            warmup_text,
+            getattr(stats, "ttfc_ms", None),
+            0 if first_audio is None else int(first_audio.size),
+        )
+    except Exception:
+        LOGGER.exception("TTS warmup failed")
+    finally:
+        if audio_iter is not None:
+            _close_iter_safely(audio_iter)
+
+
 def _iter_pcm_chunks_from_audio_stream(audio_iter: Iterator[np.ndarray]) -> Iterator[bytes]:
     tail = np.empty((0,), dtype=np.int16)
     try:
@@ -271,6 +309,69 @@ def _prepend_audio_iter(
             close()
 
 
+def _speech_stabilization_candidates(text: str) -> list[str]:
+    normalized = " ".join(text.split()).strip()
+    if not normalized:
+        return [text]
+
+    candidates: list[str] = []
+
+    def add(candidate: str) -> None:
+        candidate = " ".join(candidate.split()).strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    if os.getenv("QWEN3_TTS_ENABLE_SPEECH_STABILIZATION", "1") != "1":
+        add(normalized)
+        return candidates
+
+    lowered = normalized.lower()
+    tokens = lowered.split()
+    risky_short_copular = (
+        len(tokens) <= 5
+        and len(tokens) >= 3
+        and tokens[0] in {"it", "that", "this", "you", "he", "she", "we", "they"}
+        and tokens[1] in {"is", "are", "re"}
+    )
+    risky_yes_no_confirmation = (
+        len(tokens) <= 6
+        and len(tokens) >= 4
+        and tokens[0] in {"yes", "no"}
+        and tokens[1] in {"it", "that", "this", "you", "he", "she", "we", "they"}
+        and tokens[2] in {"is", "are", "re"}
+    )
+
+    if risky_short_copular or risky_yes_no_confirmation:
+        prioritized: list[str] = []
+        if risky_yes_no_confirmation:
+            prioritized.append(f"well {normalized}")
+            prioritized.append(f"okay {normalized}")
+            prioritized.append(normalized)
+            prioritized.append(f"here is my reply {normalized}")
+        elif lowered.startswith(("that is ", "this is ")):
+            prioritized.append(f"here is my reply {normalized}")
+            prioritized.append(normalized)
+            prioritized.append(f"okay {normalized}")
+            prioritized.append(f"well {normalized}")
+        else:
+            prioritized.append(f"okay {normalized}")
+            prioritized.append(f"well {normalized}")
+            prioritized.append(normalized)
+            prioritized.append(f"here is my reply {normalized}")
+        for candidate in prioritized:
+            add(candidate)
+        return candidates
+
+    add(normalized)
+    if not lowered.startswith("okay "):
+        add(f"okay {normalized}")
+    if not lowered.startswith("well "):
+        add(f"well {normalized}")
+    if not lowered.startswith("here is my reply "):
+        add(f"here is my reply {normalized}")
+    return candidates
+
+
 def _estimate_max_new_tokens(text: str, requested: int) -> int:
     if os.getenv("QWEN3_TTS_DYNAMIC_MAX_NEW_TOKENS", "1") != "1":
         return requested
@@ -281,9 +382,12 @@ def _estimate_max_new_tokens(text: str, requested: int) -> int:
     sentence_boundary_count = sum(text.count(ch) for ch in ".!?")
     clause_separator_count = text.count(",") + text.count(";") + text.count(":")
     token_base = int(os.getenv("QWEN3_TTS_TOKEN_BASE", "32"))
-    tokens_per_char = float(os.getenv("QWEN3_TTS_TOKENS_PER_CHAR", "1.10"))
+    tokens_per_char = float(os.getenv("QWEN3_TTS_TOKENS_PER_CHAR", "1.25"))
     punctuation_bonus = int(os.getenv("QWEN3_TTS_PUNCT_BONUS", "2"))
     min_dynamic = int(os.getenv("QWEN3_TTS_MIN_DYNAMIC_MAX_NEW_TOKENS", "128"))
+    medium_text_char_threshold = int(
+        os.getenv("QWEN3_TTS_MEDIUM_TEXT_CHAR_THRESHOLD", "40")
+    )
     short_text_char_threshold = int(
         os.getenv("QWEN3_TTS_SHORT_TEXT_CHAR_THRESHOLD", "48")
     )
@@ -293,6 +397,7 @@ def _estimate_max_new_tokens(text: str, requested: int) -> int:
     )
     min_dynamic_tiny = int(os.getenv("QWEN3_TTS_MIN_DYNAMIC_MAX_NEW_TOKENS_TINY", "28"))
     hard_min = int(os.getenv("QWEN3_TTS_HARD_MIN_EFFECTIVE_MAX_NEW_TOKENS", "16"))
+    sentence_min = int(os.getenv("QWEN3_TTS_SENTENCE_MIN_EFFECTIVE_MAX_NEW_TOKENS", "160"))
     clause_min = int(os.getenv("QWEN3_TTS_CLAUSE_MIN_EFFECTIVE_MAX_NEW_TOKENS", "64"))
 
     estimated = token_base + int(char_count * tokens_per_char) + punctuation_count * punctuation_bonus
@@ -301,18 +406,25 @@ def _estimate_max_new_tokens(text: str, requested: int) -> int:
         min_floor = min(min_floor, min_dynamic_short)
     if char_count <= tiny_text_char_threshold:
         min_floor = min(min_floor, min_dynamic_tiny)
+    if sentence_boundary_count > 0 and char_count >= medium_text_char_threshold:
+        min_floor = max(min_floor, sentence_min)
     if clause_separator_count > 0 or sentence_boundary_count > 1:
         # Clause-heavy text needs a larger decode budget to avoid truncation.
         min_floor = max(min_floor, clause_min)
     min_floor = max(hard_min, min_floor)
 
-    return max(min_floor, min(requested, estimated))
+    # Preserve the caller's requested decode budget and only bump upward when
+    # the local heuristic says more tokens are needed. The caller already
+    # applies its own text-aware estimate, so shrinking here can truncate
+    # phrases before speech ever reaches a voiced region.
+    return max(requested, min_floor, estimated)
 
 
 @app.on_event("startup")
 async def startup_event():
     if os.getenv("TTS_PRELOAD_MODEL", "0") == "1":
         engine.load()
+        _warmup_tts_engine()
 
 
 @app.post("/load_model")
@@ -414,61 +526,119 @@ async def synthesize_stream_binary(request: TTSRequest):
     stats = None
     effective_max_new_tokens = request.max_new_tokens
     last_error: str | None = None
+    selected_text = request.text
     max_attempts = max(1, int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_MAX_ATTEMPTS", "2")))
     retry_token_bump = int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_RETRY_TOKEN_BUMP", "24"))
-    non_silent_peek_chunks = int(os.getenv("QWEN3_TTS_NON_SILENT_PEEK_CHUNKS", "6"))
+    non_silent_peek_chunks = int(os.getenv("QWEN3_TTS_NON_SILENT_PEEK_CHUNKS", "8"))
     non_silent_rms = float(os.getenv("QWEN3_TTS_NON_SILENT_RMS", "0.0015"))
     require_non_silent_prefix = os.getenv("QWEN3_TTS_REQUIRE_NON_SILENT_PREFIX", "0") == "1"
+    candidate_texts = _speech_stabilization_candidates(request.text)
+    selected_candidate_index = 0
 
-    for attempt in range(max_attempts):
-        attempt_max_new_tokens = min(8192, request.max_new_tokens + attempt * retry_token_bump)
-        try:
-            stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
-                text=request.text,
-                voice=request.voice,
-                max_new_tokens=attempt_max_new_tokens,
-            )
-            prefix, has_non_silent = _peek_audio_prefix(
-                audio_iter,
-                max_chunks=non_silent_peek_chunks,
-                rms_threshold=non_silent_rms,
-            )
-            if not prefix:
-                _close_iter_safely(audio_iter)
-                audio_iter = None
-                last_error = "Model returned no audio chunks from decode-time stream."
-                continue
+    for candidate_index, candidate_text in enumerate(candidate_texts):
+        for attempt in range(max_attempts):
+            attempt_max_new_tokens = min(8192, request.max_new_tokens + attempt * retry_token_bump)
+            try:
+                stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
+                    text=candidate_text,
+                    voice=request.voice,
+                    max_new_tokens=attempt_max_new_tokens,
+                )
+                if non_silent_peek_chunks <= 0:
+                    first_audio = next(audio_iter, None)
+                    if first_audio is None or first_audio.size == 0:
+                        _close_iter_safely(audio_iter)
+                        audio_iter = None
+                        last_error = "Model returned no audio chunks from decode-time stream."
+                        continue
+                    selected_text = candidate_text
+                    selected_candidate_index = candidate_index
+                    break
 
-            if has_non_silent:
-                while len(prefix) > 1 and _is_effectively_silent(prefix[0], non_silent_rms):
-                    prefix.pop(0)
-                first_audio = prefix[0]
-                audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
-                break
-
-            if require_non_silent_prefix:
-                _close_iter_safely(audio_iter)
-                audio_iter = None
-                last_error = "Leading decode-time audio chunks were effectively silent."
-                if attempt < max_attempts - 1:
+                prefix, has_non_silent = _peek_audio_prefix(
+                    audio_iter,
+                    max_chunks=non_silent_peek_chunks,
+                    rms_threshold=non_silent_rms,
+                )
+                if not prefix:
+                    _close_iter_safely(audio_iter)
+                    audio_iter = None
+                    last_error = "Model returned no audio chunks from decode-time stream."
                     continue
-            else:
+
+                if has_non_silent:
+                    while len(prefix) > 1 and _is_effectively_silent(prefix[0], non_silent_rms):
+                        prefix.pop(0)
+                    first_audio = prefix[0]
+                    audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
+                    selected_text = candidate_text
+                    selected_candidate_index = candidate_index
+                    break
+
                 LOGGER.warning(
-                    "Leading decode-time chunks appear silent; streaming anyway (attempt %d/%d).",
+                    "Leading decode-time audio remained silent for the initial prefix "
+                    "(candidate %d/%d, attempt %d/%d).",
+                    candidate_index + 1,
+                    len(candidate_texts),
                     attempt + 1,
                     max_attempts,
                 )
-                first_audio = prefix[0]
-                audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
-                break
-        except Exception as exc:
-            if audio_iter is not None:
                 _close_iter_safely(audio_iter)
                 audio_iter = None
-            last_error = f"Primary decode-time stream failed: {exc}"
-            if attempt < max_attempts - 1:
+                last_error = "Leading decode-time audio chunks were effectively silent."
                 continue
-            LOGGER.exception("TTS /synthesize_binary primary stream failed")
+            except Exception as exc:
+                if audio_iter is not None:
+                    _close_iter_safely(audio_iter)
+                    audio_iter = None
+                last_error = f"Primary decode-time stream failed: {exc}"
+                if attempt < max_attempts - 1:
+                    continue
+                LOGGER.exception("TTS /synthesize_binary primary stream failed")
+        if first_audio is not None and audio_iter is not None and stats is not None:
+            break
+
+    if (
+        (first_audio is None or audio_iter is None or stats is None)
+        and not require_non_silent_prefix
+        and candidate_texts
+    ):
+        # Final fallback within the same local decode-time streaming backend:
+        # if all stabilization candidates stayed silent, preserve previous
+        # behavior and stream the original request immediately.
+        candidate_text = candidate_texts[0]
+        for attempt in range(max_attempts):
+            attempt_max_new_tokens = min(8192, request.max_new_tokens + attempt * retry_token_bump)
+            try:
+                stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
+                    text=candidate_text,
+                    voice=request.voice,
+                    max_new_tokens=attempt_max_new_tokens,
+                )
+                if non_silent_peek_chunks <= 0:
+                    first_audio = next(audio_iter, None)
+                else:
+                    prefix, _ = _peek_audio_prefix(
+                        audio_iter,
+                        max_chunks=non_silent_peek_chunks,
+                        rms_threshold=non_silent_rms,
+                    )
+                    if prefix:
+                        first_audio = prefix[0]
+                        audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
+                if first_audio is not None and first_audio.size > 0:
+                    selected_text = candidate_text
+                    selected_candidate_index = 0
+                    LOGGER.info(
+                        "Streaming decode-time audio despite silent prefix after exhausting stabilization candidates."
+                    )
+                    break
+                _close_iter_safely(audio_iter)
+                audio_iter = None
+            except Exception:
+                if audio_iter is not None:
+                    _close_iter_safely(audio_iter)
+                    audio_iter = None
 
     if first_audio is None or audio_iter is None or stats is None:
         raise HTTPException(
@@ -487,8 +657,18 @@ async def synthesize_stream_binary(request: TTSRequest):
         "X-RTF": "na",
         "X-Streaming-Mode": "decode_time_codec_stream",
         "X-Max-New-Tokens-Effective": str(effective_max_new_tokens),
-        "X-Decode-Stride": str(DECODE_STRIDE),
+        "X-Decode-Stride": _decode_stride_header_value(),
+        "X-Stop-Reason": getattr(stats, "stop_reason", "unknown"),
+        "X-Text-Stabilized": "1" if selected_candidate_index > 0 else "0",
     }
+    if selected_candidate_index > 0:
+        LOGGER.info(
+            "TTS speech stabilization selected candidate %d/%d: %r -> %r",
+            selected_candidate_index + 1,
+            len(candidate_texts),
+            request.text,
+            selected_text,
+        )
     return StreamingResponse(
         _iter_pcm_chunks_from_audio_stream(_merged_audio_iter(first_audio, audio_iter)),
         media_type="audio/pcm",
@@ -519,6 +699,10 @@ async def spec():
         "format": "16-bit PCM, mono",
         "status": "talker megakernel + incremental codec decode",
         "default_voice": engine.default_voice,
+        "decode_stride": _decode_stride_header_value(),
+        "incremental_left_context_frames": int(
+            os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "25")
+        ),
     }
 
 

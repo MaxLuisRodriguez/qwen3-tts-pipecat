@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark helper for local Megakernel + Qwen3-TTS services."""
+"""Service-level benchmark helper for local Megakernel + Qwen3-TTS services."""
 
 from __future__ import annotations
 
@@ -142,13 +142,17 @@ def main() -> None:
     llm = benchmark_llm(args.llm_url, args.llm_prompt, args.llm_max_tokens, args.timeout_s)
     tts = benchmark_tts(args.tts_url, args.tts_text, args.tts_max_new_tokens, args.timeout_s)
 
-    # Simple additive estimate for "speech in -> speech out" excluding STT variance.
-    e2e_estimate_ms = llm.ttft_ms + tts.first_chunk_ms
+    # Service-only additive estimate for "LLM first token -> TTS first chunk".
+    # This excludes STT, Daily transport, and browser playback. Use
+    # scripts/benchmark_roundtrip.py for end-to-end Pipecat turn metrics.
+    service_pipeline_estimate_ms = llm.ttft_ms + tts.first_chunk_ms
 
     result = {
         "llm": asdict(llm),
         "tts": asdict(tts),
-        "e2e_estimate_ms": e2e_estimate_ms,
+        "service_pipeline_estimate_ms": service_pipeline_estimate_ms,
+        "e2e_estimate_ms": service_pipeline_estimate_ms,
+        "estimate_scope": "service_only_excludes_stt_daily_browser",
     }
 
     if args.json:
@@ -167,8 +171,8 @@ def main() -> None:
     print(f"  header_ttfc_ms: {tts.header_ttfc_ms if tts.header_ttfc_ms is not None else 'n/a'}")
     print(f"  total_ms: {tts.total_ms:.2f}")
     print(f"  rtf: {tts.rtf:.4f}")
-    print("E2E")
-    print(f"  estimate_ms (llm_ttft + tts_first_chunk): {e2e_estimate_ms:.2f}")
+    print("Service Estimate")
+    print(f"  estimate_ms (llm_ttft + tts_first_chunk): {service_pipeline_estimate_ms:.2f}")
 
 
 if __name__ == "__main__":

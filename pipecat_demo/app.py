@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
@@ -80,17 +81,29 @@ class MegakernelLLMClient:
         self._llm_retry_backoff_s = float(os.getenv("PIPECAT_LLM_RETRY_BACKOFF_S", "0.35"))
         self._max_history_turns = int(os.getenv("PIPECAT_MAX_HISTORY_TURNS", "8"))
         self._max_assistant_history_turns = max(
-            0, int(os.getenv("PIPECAT_MAX_ASSISTANT_HISTORY_TURNS", "1"))
+            0, int(os.getenv("PIPECAT_MAX_ASSISTANT_HISTORY_TURNS", "0"))
         )
         self._response_first_line_only = os.getenv("PIPECAT_RESPONSE_FIRST_LINE_ONLY", "0") == "1"
         self._response_first_sentence_only = (
-            os.getenv("PIPECAT_RESPONSE_FIRST_SENTENCE_ONLY", "0") == "1"
+            os.getenv("PIPECAT_RESPONSE_FIRST_SENTENCE_ONLY", "1") == "1"
         )
-        self._response_max_chars = int(os.getenv("PIPECAT_RESPONSE_MAX_CHARS", "220"))
+        self._response_max_chars = int(os.getenv("PIPECAT_RESPONSE_MAX_CHARS", "120"))
+        self._response_clause_soft_limit = int(
+            os.getenv("PIPECAT_RESPONSE_CLAUSE_SOFT_LIMIT", "80")
+        )
         self._max_repeat_sentence_run = int(os.getenv("PIPECAT_MAX_REPEAT_SENTENCE_RUN", "3"))
 
     def _build_prompt(self, user_text: str) -> str:
-        turns = self._history[-self._max_history_turns :]
+        return self._build_prompt_with_options(user_text)
+
+    def _build_prompt_with_options(
+        self,
+        user_text: str,
+        *,
+        drop_history: bool = False,
+        extra_instruction: str | None = None,
+    ) -> str:
+        turns = [] if drop_history else self._history[-self._max_history_turns :]
         if self._max_assistant_history_turns >= 0:
             kept_assistants = 0
             filtered_reversed: list[tuple[str, str]] = []
@@ -101,7 +114,13 @@ class MegakernelLLMClient:
                     kept_assistants += 1
                 filtered_reversed.append((role, content))
             turns = list(reversed(filtered_reversed))
-        lines = [f"System: {self._system_prompt}"]
+        lines = [
+            f"System: {self._system_prompt}",
+            "System: Respond directly in one short sentence. Do not narrate the transcript or your reasoning.",
+            "System: Prefer a simple subject-verb sentence, such as 'It is blue.' or 'My favorite color is blue.', over noun-first phrasing.",
+        ]
+        if extra_instruction:
+            lines.append(f"System: {extra_instruction}")
         last_assistant = next(
             (content for role, content in reversed(turns) if role == "assistant" and content.strip()),
             None,
@@ -207,6 +226,29 @@ class MegakernelLLMClient:
         if normalized.startswith(bad_prefixes):
             return True
         words = normalized.split()
+        if len(words) >= 3:
+            run = 1
+            best_run = 1
+            for idx in range(1, len(words)):
+                if words[idx] == words[idx - 1]:
+                    run += 1
+                    best_run = max(best_run, run)
+                else:
+                    run = 1
+            if best_run >= 3:
+                return True
+            for ngram_size in (2, 3):
+                if len(words) >= ngram_size * 3:
+                    pattern = words[-ngram_size:]
+                    repeats = 1
+                    while len(words) >= (repeats + 1) * ngram_size:
+                        start = len(words) - (repeats + 1) * ngram_size
+                        end = start + ngram_size
+                        if words[start:end] != pattern:
+                            break
+                        repeats += 1
+                    if repeats >= 3:
+                        return True
         if len(words) >= 8:
             tail = " ".join(words[-4:])
             if normalized.count(tail) >= 2:
@@ -230,6 +272,15 @@ class MegakernelLLMClient:
                 if ch in ".?!":
                     response = response[: i + 1].strip()
                     break
+        if (
+            self._response_clause_soft_limit > 0
+            and len(response) > self._response_clause_soft_limit
+        ):
+            for sep in (",", ";", ":"):
+                sep_pos = response.find(sep)
+                if 24 <= sep_pos <= self._response_clause_soft_limit:
+                    response = response[:sep_pos].rstrip(" \t\r\n,;:-")
+                    break
         if self._response_max_chars > 0 and len(response) > self._response_max_chars:
             if not self._response_first_sentence_only:
                 response = response[: self._response_max_chars]
@@ -244,8 +295,18 @@ class MegakernelLLMClient:
         stop_markers = ("\nUser:", "\nAssistant:", "\nSystem:")
         started = time.perf_counter()
         response = ""
+        recovery_mode = False
         for attempt in range(self._llm_max_attempts):
-            prompt = self._build_prompt(user_text)
+            prompt = self._build_prompt_with_options(
+                user_text,
+                drop_history=recovery_mode,
+                extra_instruction=(
+                    "Answer the current user request naturally in 2 to 8 words. "
+                    "Do not repeat any word or phrase."
+                    if recovery_mode
+                    else None
+                ),
+            )
             parts = []
             emitted_chunks = 0
             self._service_done_metrics = {}
@@ -272,10 +333,19 @@ class MegakernelLLMClient:
                     await asyncio.sleep(self._llm_retry_backoff_s * (attempt + 1))
                     continue
                 response = candidate
+                if self._is_low_quality_assistant_response(response):
+                    recovery_mode = True
+                    last_exc = RuntimeError(
+                        "LLM produced a repetitive or low-quality response; retrying."
+                    )
+                    if attempt < self._llm_max_attempts - 1:
+                        await asyncio.sleep(self._llm_retry_backoff_s * (attempt + 1))
+                        continue
                 if emitted_chunks > 0 or attempt == self._llm_max_attempts - 1:
                     break
             except Exception as exc:
                 last_exc = exc
+                recovery_mode = True
                 if attempt == self._llm_max_attempts - 1:
                     raise
                 await asyncio.sleep(self._llm_retry_backoff_s * (attempt + 1))
@@ -375,9 +445,12 @@ class LocalQwenTTSService(TTSService):
         self._in_sample_rate = in_sample_rate
         self._dynamic_max_new_tokens = os.getenv("PIPECAT_TTS_DYNAMIC_MAX_NEW_TOKENS", "1") == "1"
         self._tts_token_base = int(os.getenv("PIPECAT_TTS_TOKEN_BASE", "32"))
-        self._tts_tokens_per_char = float(os.getenv("PIPECAT_TTS_TOKENS_PER_CHAR", "0.75"))
+        self._tts_tokens_per_char = float(os.getenv("PIPECAT_TTS_TOKENS_PER_CHAR", "1.0"))
         self._tts_punct_bonus = int(os.getenv("PIPECAT_TTS_PUNCT_BONUS", "2"))
         self._tts_min_new_tokens = int(os.getenv("PIPECAT_TTS_MIN_NEW_TOKENS", "80"))
+        self._tts_medium_text_char_threshold = int(
+            os.getenv("PIPECAT_TTS_MEDIUM_TEXT_CHAR_THRESHOLD", "40")
+        )
         self._tts_short_text_char_threshold = int(
             os.getenv("PIPECAT_TTS_SHORT_TEXT_CHAR_THRESHOLD", "48")
         )
@@ -393,11 +466,15 @@ class LocalQwenTTSService(TTSService):
         self._tts_api_min_new_tokens = int(
             os.getenv("PIPECAT_TTS_API_MIN_NEW_TOKENS", "64")
         )
+        self._tts_sentence_min_new_tokens = int(
+            os.getenv("PIPECAT_TTS_SENTENCE_MIN_NEW_TOKENS", "160")
+        )
         self._tts_normalize_numbers = os.getenv("PIPECAT_TTS_NORMALIZE_NUMBERS", "1") == "1"
         self._tts_max_normalize_number = int(
             os.getenv("PIPECAT_TTS_MAX_NORMALIZE_NUMBER", "9999")
         )
         self._tts_strip_punctuation = os.getenv("PIPECAT_TTS_STRIP_PUNCTUATION", "1") == "1"
+        self._tts_lowercase_text = os.getenv("PIPECAT_TTS_LOWERCASE_TEXT", "1") == "1"
         self._last_tts_had_audio = False
         self._last_tts_metrics: dict[str, Any] = {}
         self._current_turn_context: dict[str, Any] = {}
@@ -414,6 +491,7 @@ class LocalQwenTTSService(TTSService):
         stripped = text.strip()
         char_count = len(stripped)
         punct = sum(stripped.count(ch) for ch in ".!?;,")
+        sentence_boundary_count = sum(stripped.count(ch) for ch in ".!?")
         estimate = self._tts_token_base + int(char_count * self._tts_tokens_per_char)
         estimate += punct * self._tts_punct_bonus
 
@@ -422,6 +500,8 @@ class LocalQwenTTSService(TTSService):
             min_floor = min(min_floor, self._tts_min_new_tokens_short)
         if char_count <= self._tts_tiny_text_char_threshold:
             min_floor = min(min_floor, self._tts_min_new_tokens_tiny)
+        if sentence_boundary_count > 0 and char_count >= self._tts_medium_text_char_threshold:
+            min_floor = max(min_floor, self._tts_sentence_min_new_tokens)
         min_floor = max(self._tts_api_min_new_tokens, min_floor)
 
         return max(self._tts_api_min_new_tokens, max(min_floor, min(self._max_new_tokens, estimate)))
@@ -524,6 +604,38 @@ class LocalQwenTTSService(TTSService):
         cleaned = text.strip()
         if not cleaned:
             return cleaned
+        cleaned = cleaned.replace("\u2019", "'")
+        contraction_rewrites = (
+            (r"\bain't\b", "is not"),
+            (r"\baren't\b", "are not"),
+            (r"\bcan't\b", "cannot"),
+            (r"\bcouldn't\b", "could not"),
+            (r"\bdidn't\b", "did not"),
+            (r"\bdoesn't\b", "does not"),
+            (r"\bdon't\b", "do not"),
+            (r"\bhaven't\b", "have not"),
+            (r"\bhe's\b", "he is"),
+            (r"\bi'm\b", "i am"),
+            (r"\bisn't\b", "is not"),
+            (r"\bit's\b", "it is"),
+            (r"\blet's\b", "let us"),
+            (r"\bshe's\b", "she is"),
+            (r"\bthat's\b", "that is"),
+            (r"\bthere's\b", "there is"),
+            (r"\bthey're\b", "they are"),
+            (r"\bwe're\b", "we are"),
+            (r"\bwhat's\b", "what is"),
+            (r"\bwho's\b", "who is"),
+            (r"\bwon't\b", "will not"),
+            (r"\bwouldn't\b", "would not"),
+            (r"\byou're\b", "you are"),
+            (r"\b([A-Za-z]+)'ll\b", r"\1 will"),
+            (r"\b([A-Za-z]+)'ve\b", r"\1 have"),
+            (r"\b([A-Za-z]+)'d\b", r"\1 would"),
+            (r"\b([A-Za-z]+)n't\b", r"\1 not"),
+        )
+        for pattern, replacement in contraction_rewrites:
+            cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
         if self._tts_normalize_numbers:
             cleaned = re.sub(
                 r"(?<!\w)-?\d[\d,]*(?:\.\d+)?(?!\w)",
@@ -533,6 +645,61 @@ class LocalQwenTTSService(TTSService):
         if self._tts_strip_punctuation:
             cleaned = re.sub(r"[^\w\s]", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if self._tts_lowercase_text:
+            cleaned = cleaned.lower()
+        # Some short arithmetic-result phrasings are unstable in the local
+        # Qwen3-TTS talker path (e.g. "three plus three is six"), while a
+        # semantically equivalent answer form is reliable. Rewrite only this
+        # narrow pattern for speech without changing the upstream LLM/output
+        # pipeline.
+        match = re.fullmatch(
+            r"(?P<lhs>.+?)\s+(?:is|equals)\s+(?P<rhs>[a-z0-9][a-z0-9\s-]*)",
+            cleaned,
+        )
+        if match:
+            lhs = match.group("lhs").strip()
+            rhs = match.group("rhs").strip()
+            arithmetic_markers = (
+                " plus ",
+                " minus ",
+                " times ",
+                " multiplied by ",
+                " divided by ",
+                " over ",
+            )
+            if any(marker in f" {lhs} " for marker in arithmetic_markers):
+                cleaned = f"the answer is {rhs}"
+        # Short compliment/acknowledgment replies are another fragile shape in
+        # the local talker path. Rewrite only the unstable compliment forms to
+        # a semantically equivalent acknowledgment that speaks reliably.
+        compliment_match = re.fullmatch(
+            r"you\s+(?:are|re)\s+(?:(?:very|so|really)\s+)?(?P<adj>[a-z][a-z\s-]*)",
+            cleaned,
+        )
+        if compliment_match:
+            compliment_adj = compliment_match.group("adj").strip()
+            fragile_compliments = {
+                "beautiful",
+                "lovely",
+                "kind",
+                "very kind",
+                "so kind",
+                "really kind",
+                "sweet",
+                "nice",
+                "wonderful",
+                "amazing",
+                "great",
+                "awesome",
+                "pretty",
+                "handsome",
+                "cute",
+                "brilliant",
+            }
+            if compliment_adj in fragile_compliments:
+                cleaned = "thank you that is kind of you"
+        if cleaned == "that is kind of you":
+            cleaned = "thank you that is kind of you"
         return cleaned
 
     @staticmethod
@@ -543,6 +710,18 @@ class LocalQwenTTSService(TTSService):
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _pcm16_is_effectively_silent(audio_bytes: bytes, rms_threshold: float) -> bool:
+        if not audio_bytes:
+            return True
+        pcm = np.frombuffer(audio_bytes, dtype=np.int16)
+        if pcm.size == 0:
+            return True
+        pcm_f32 = pcm.astype(np.float32, copy=False) / 32767.0
+        rms = float(np.sqrt(np.mean(np.square(pcm_f32))))
+        peak = float(np.max(np.abs(pcm_f32)))
+        return rms < rms_threshold and peak < (rms_threshold * 3.0)
 
     def get_last_metrics(self) -> dict[str, Any]:
         return dict(self._last_tts_metrics)
@@ -620,7 +799,8 @@ class LocalQwenTTSService(TTSService):
             f"frame_by_frame={'yes' if frame_by_frame else 'no'} "
             f"chunk_count={chunk_count} "
             f"decode_stride={tts_metrics.get('decode_stride', 'unknown')} "
-            f"max_new_tokens_effective={tts_metrics.get('max_new_tokens_effective', 'unknown')}"
+            f"max_new_tokens_effective={tts_metrics.get('max_new_tokens_effective', 'unknown')} "
+            f"stop_reason={tts_metrics.get('stop_reason', 'unknown')}"
         )
         print(
             "[metrics][quality] "
@@ -663,6 +843,7 @@ class LocalQwenTTSService(TTSService):
             "streaming_mode": "unknown",
             "decode_stride": "unknown",
             "max_new_tokens_effective": "unknown",
+            "stop_reason": "unknown",
             "audio_quality_ok": False,
             "dropped_frames_suspected": False,
             "error": None,
@@ -695,7 +876,27 @@ class LocalQwenTTSService(TTSService):
                 streaming_mode = "unknown"
                 decode_stride = "unknown"
                 max_new_tokens_effective = str(effective_max_new_tokens)
+                stop_reason = "unknown"
                 timed_out_mid_stream = False
+                read_chunk_bytes = int(
+                    os.getenv(
+                        "PIPECAT_TTS_HTTP_READ_CHUNK_BYTES",
+                        str(max(4096, self.chunk_size // 6)),
+                    )
+                )
+                read_chunk_bytes = max(512, read_chunk_bytes - (read_chunk_bytes % 2))
+                strip_leading_silence = (
+                    os.getenv("PIPECAT_TTS_STRIP_LEADING_SILENCE", "0") == "1"
+                )
+                leading_silence_rms = float(
+                    os.getenv("PIPECAT_TTS_LEADING_SILENCE_RMS", "0.0015")
+                )
+                max_leading_silence_bytes = int(
+                    os.getenv(
+                        "PIPECAT_TTS_MAX_LEADING_SILENCE_BYTES",
+                        str(int(self._in_sample_rate * 2 * 2.0)),
+                    )
+                )
                 try:
                     async with self._session.post(
                         f"{self._base_url}/synthesize_binary",
@@ -718,11 +919,14 @@ class LocalQwenTTSService(TTSService):
                             "X-Max-New-Tokens-Effective",
                             str(effective_max_new_tokens),
                         )
+                        stop_reason = response.headers.get("X-Stop-Reason", "unknown")
 
                         async def counted_chunks():
                             nonlocal raw_bytes, raw_chunk_count, first_chunk_at, last_chunk_at, max_chunk_gap_s
                             nonlocal timed_out_mid_stream
-                            chunk_iter = response.content.iter_chunked(self.chunk_size).__aiter__()
+                            chunk_iter = response.content.iter_chunked(read_chunk_bytes).__aiter__()
+                            skipped_leading_silence_bytes = 0
+                            emitted_audio = False
                             while True:
                                 timeout_s = first_chunk_timeout_s if raw_chunk_count == 0 else stream_idle_timeout_s
                                 try:
@@ -737,6 +941,16 @@ class LocalQwenTTSService(TTSService):
                                     # Treat a late idle timeout as stream end, not hard failure.
                                     timed_out_mid_stream = True
                                     break
+                                if not chunk:
+                                    continue
+                                if strip_leading_silence and not emitted_audio:
+                                    if (
+                                        skipped_leading_silence_bytes < max_leading_silence_bytes
+                                        and self._pcm16_is_effectively_silent(chunk, leading_silence_rms)
+                                    ):
+                                        skipped_leading_silence_bytes += len(chunk)
+                                        continue
+                                    emitted_audio = True
                                 now = time.perf_counter()
                                 if first_chunk_at is None:
                                     first_chunk_at = now
@@ -744,8 +958,7 @@ class LocalQwenTTSService(TTSService):
                                     max_chunk_gap_s = max(max_chunk_gap_s, now - last_chunk_at)
                                 last_chunk_at = now
                                 raw_bytes += len(chunk)
-                                if chunk:
-                                    raw_chunk_count += 1
+                                raw_chunk_count += 1
                                 yield chunk
 
                         await self.start_tts_usage_metrics(cleaned_text)
@@ -795,6 +1008,7 @@ class LocalQwenTTSService(TTSService):
                             "streaming_mode": streaming_mode,
                             "decode_stride": decode_stride,
                             "max_new_tokens_effective": max_new_tokens_effective,
+                            "stop_reason": stop_reason,
                             "audio_quality_ok": bool(audio_quality_ok),
                             "dropped_frames_suspected": bool(dropped_frames_suspected),
                             "error": (
@@ -871,6 +1085,29 @@ async def _create_daily_session(api_key: str) -> DailySession:
     return DailySession(room_url=room_info["url"], token=token_info["token"])
 
 
+async def _create_daily_token_for_room(api_key: str, room_name: str) -> str:
+    """Create a meeting token for an existing Daily room."""
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    token_payload = {"properties": {"room_name": room_name, "is_owner": True}}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://api.daily.co/v1/meeting-tokens",
+            json=token_payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as token_resp:
+            if token_resp.status not in (200, 201):
+                body = await token_resp.text()
+                raise RuntimeError(
+                    f"Daily token creation for room '{room_name}' failed "
+                    f"({token_resp.status}): {body}"
+                )
+            token_info = await token_resp.json()
+
+    return token_info["token"]
+
+
 async def _resolve_daily_session() -> DailySession:
     room_url = os.getenv("DAILY_ROOM_URL")
     room_token = os.getenv("DAILY_ROOM_TOKEN")
@@ -878,6 +1115,18 @@ async def _resolve_daily_session() -> DailySession:
         return DailySession(room_url=room_url, token=room_token)
 
     api_key = os.getenv("DAILY_API_KEY")
+    if room_url and api_key:
+        room_name = os.getenv("DAILY_ROOM_NAME")
+        if not room_name:
+            room_name = urlparse(room_url).path.strip("/")
+        if not room_name:
+            raise RuntimeError(
+                "Could not infer Daily room name from DAILY_ROOM_URL. "
+                "Set DAILY_ROOM_NAME explicitly."
+            )
+        room_token = await _create_daily_token_for_room(api_key, room_name)
+        return DailySession(room_url=room_url, token=room_token)
+
     if not api_key:
         raise RuntimeError(
             "Missing Daily credentials. Set DAILY_ROOM_URL+DAILY_ROOM_TOKEN, "
@@ -967,6 +1216,11 @@ async def main():
             assistant_turn_done.clear()
 
         def _on_tts_stopped():
+            tts_metrics = tts.get_last_metrics()
+            if tts_metrics.get("had_audio") and not tts_metrics.get("error"):
+                llm_client.commit_staged_turn()
+            else:
+                llm_client.drop_staged_turn()
             assistant_turn_done.set()
 
         tts.set_turn_state_callbacks(on_started=_on_tts_started, on_stopped=_on_tts_stopped)
@@ -1004,7 +1258,6 @@ async def main():
                 llm_metrics = llm_client.get_last_metrics()
                 print(f"[assistant] {reply}")
                 llm_client.stage_turn(user_text, reply)
-                llm_client.commit_staged_turn(reply)
                 tts.set_turn_context(
                     user_text=user_text,
                     assistant_text=reply,
@@ -1014,6 +1267,7 @@ async def main():
                 try:
                     await task.queue_frame(TTSSpeakFrame(reply))
                 except Exception:
+                    llm_client.drop_staged_turn()
                     assistant_turn_done.set()
                     raise
 

@@ -1542,6 +1542,28 @@ extern "C" void launch_ldg_decode_from_hidden_direct(
       d_lm_head_counter, LDG_LM_NUM_BLOCKS, vocab_size);
 }
 
+extern "C" void launch_ldg_decode_hidden_only_direct(
+    const void *input_hidden, const LDGLayerWeights *layer_weights,
+    const void *final_norm_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, int num_layers, int position,
+    int max_seq_len, float attn_scale, cudaStream_t stream) {
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+
+  ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+      nullptr, (const __nv_bfloat16 *)input_hidden, layer_weights,
+      (const __nv_bfloat16 *)final_norm_weight,
+      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
+      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
+      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
+      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      position, 0, max_seq_len, attn_scale, 1);
+}
+
 extern "C" void launch_ldg_decode_persistent(
     int input_token_id, int *output_token_id, const void *embed_weight,
     const LDGLayerWeights *layer_weights, const void *final_norm_weight,
