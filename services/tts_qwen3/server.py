@@ -39,10 +39,10 @@ DECODE_STRIDE = int(os.getenv("QWEN3_TTS_DECODE_STRIDE", "1"))
 
 def _decode_stride_header_value() -> str:
     if os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1":
-        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "2")))
-        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "4")))
+        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "8")))
+        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "16")))
         late_start = int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24"))
-        left_context = max(0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "25")))
+        left_context = max(0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "12")))
         return f"adaptive(mid={mid},late={late}@{late_start},ctx={left_context})"
     return str(DECODE_STRIDE)
 
@@ -326,20 +326,7 @@ def _speech_stabilization_candidates(text: str) -> list[str]:
         return candidates
 
     lowered = normalized.lower()
-    tokens = lowered.split()
-    risky_short_copular = (
-        len(tokens) <= 5
-        and len(tokens) >= 3
-        and tokens[0] in {"it", "that", "this", "you", "he", "she", "we", "they"}
-        and tokens[1] in {"is", "are", "re"}
-    )
-    risky_yes_no_confirmation = (
-        len(tokens) <= 6
-        and len(tokens) >= 4
-        and tokens[0] in {"yes", "no"}
-        and tokens[1] in {"it", "that", "this", "you", "he", "she", "we", "they"}
-        and tokens[2] in {"is", "are", "re"}
-    )
+    risky_short_copular, risky_yes_no_confirmation = _speech_text_risk_flags(lowered)
 
     if risky_short_copular or risky_yes_no_confirmation:
         prioritized: list[str] = []
@@ -370,6 +357,35 @@ def _speech_stabilization_candidates(text: str) -> list[str]:
     if not lowered.startswith("here is my reply "):
         add(f"here is my reply {normalized}")
     return candidates
+
+
+def _speech_text_risk_flags(lowered_text: str) -> tuple[bool, bool]:
+    tokens = lowered_text.split()
+    risky_short_copular = (
+        len(tokens) <= 5
+        and len(tokens) >= 3
+        and tokens[0] in {"it", "that", "this", "you", "he", "she", "we", "they"}
+        and tokens[1] in {"is", "are", "re"}
+    )
+    risky_yes_no_confirmation = (
+        len(tokens) <= 6
+        and len(tokens) >= 4
+        and tokens[0] in {"yes", "no"}
+        and tokens[1] in {"it", "that", "this", "you", "he", "she", "we", "they"}
+        and tokens[2] in {"is", "are", "re"}
+    )
+    return risky_short_copular, risky_yes_no_confirmation
+
+
+def _prefers_strict_prefix_probe(text: str) -> bool:
+    lowered = " ".join(text.split()).strip().lower()
+    if not lowered:
+        return False
+    risky_short_copular, risky_yes_no_confirmation = _speech_text_risk_flags(lowered)
+    if risky_short_copular or risky_yes_no_confirmation:
+        return True
+    token_count = len(lowered.split())
+    return token_count <= 4
 
 
 def _estimate_max_new_tokens(text: str, requested: int) -> int:
@@ -529,7 +545,10 @@ async def synthesize_stream_binary(request: TTSRequest):
     selected_text = request.text
     max_attempts = max(1, int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_MAX_ATTEMPTS", "2")))
     retry_token_bump = int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_RETRY_TOKEN_BUMP", "24"))
-    non_silent_peek_chunks = int(os.getenv("QWEN3_TTS_NON_SILENT_PEEK_CHUNKS", "8"))
+    non_silent_peek_chunks = int(os.getenv("QWEN3_TTS_NON_SILENT_PEEK_CHUNKS", "1"))
+    strict_non_silent_peek_chunks = int(
+        os.getenv("QWEN3_TTS_STRICT_NON_SILENT_PEEK_CHUNKS", "12")
+    )
     non_silent_rms = float(os.getenv("QWEN3_TTS_NON_SILENT_RMS", "0.0015"))
     require_non_silent_prefix = os.getenv("QWEN3_TTS_REQUIRE_NON_SILENT_PREFIX", "0") == "1"
     candidate_texts = _speech_stabilization_candidates(request.text)
@@ -544,7 +563,11 @@ async def synthesize_stream_binary(request: TTSRequest):
                     voice=request.voice,
                     max_new_tokens=attempt_max_new_tokens,
                 )
-                if non_silent_peek_chunks <= 0:
+                peek_chunks = non_silent_peek_chunks
+                if _prefers_strict_prefix_probe(candidate_text) or candidate_index > 0:
+                    peek_chunks = max(peek_chunks, strict_non_silent_peek_chunks)
+
+                if peek_chunks <= 0:
                     first_audio = next(audio_iter, None)
                     if first_audio is None or first_audio.size == 0:
                         _close_iter_safely(audio_iter)
@@ -557,7 +580,7 @@ async def synthesize_stream_binary(request: TTSRequest):
 
                 prefix, has_non_silent = _peek_audio_prefix(
                     audio_iter,
-                    max_chunks=non_silent_peek_chunks,
+                    max_chunks=peek_chunks,
                     rms_threshold=non_silent_rms,
                 )
                 if not prefix:
@@ -615,12 +638,16 @@ async def synthesize_stream_binary(request: TTSRequest):
                     voice=request.voice,
                     max_new_tokens=attempt_max_new_tokens,
                 )
-                if non_silent_peek_chunks <= 0:
+                peek_chunks = non_silent_peek_chunks
+                if _prefers_strict_prefix_probe(candidate_text):
+                    peek_chunks = max(peek_chunks, strict_non_silent_peek_chunks)
+
+                if peek_chunks <= 0:
                     first_audio = next(audio_iter, None)
                 else:
                     prefix, _ = _peek_audio_prefix(
                         audio_iter,
-                        max_chunks=non_silent_peek_chunks,
+                        max_chunks=peek_chunks,
                         rms_threshold=non_silent_rms,
                     )
                     if prefix:

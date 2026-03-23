@@ -7,6 +7,7 @@
 2. Streaming correctness vs latency:
    - Decoding too frequently inflates compute overhead.
    - Decoding too sparsely hurts TTFC or risks audible discontinuity.
+   - Silent-prefix probing can dominate client-observed first chunk time even when backend TTFC is much lower.
 3. Model/runtime variability:
    - `flash-attn` compatibility can fail on some host stacks.
    - Local-vs-remote model resolution can introduce startup stalls.
@@ -23,7 +24,11 @@
    - `QWEN3_TTS_DECODE_STRIDE_MID`
    - `QWEN3_TTS_DECODE_STRIDE_LATE`
    - `QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES`
-4. Hardened response stability:
+4. Fixed benchmark reproducibility:
+   - benchmark scripts now launch services with the same env normalization and preload behavior as `run_local.sh`
+5. Reduced client-side buffering in benchmark helpers:
+   - `scripts/benchmark_stack.py` now reads smaller HTTP chunks so service-level first-chunk numbers better reflect the streaming path
+6. Hardened response stability:
    - `pipecat_demo/app.py` text stabilization and chunking before TTS push.
 
 ## How Benchmark Accuracy Is Established

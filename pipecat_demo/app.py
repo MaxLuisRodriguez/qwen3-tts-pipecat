@@ -881,7 +881,7 @@ class LocalQwenTTSService(TTSService):
                 read_chunk_bytes = int(
                     os.getenv(
                         "PIPECAT_TTS_HTTP_READ_CHUNK_BYTES",
-                        str(max(4096, self.chunk_size // 6)),
+                        "960",
                     )
                 )
                 read_chunk_bytes = max(512, read_chunk_bytes - (read_chunk_bytes % 2))

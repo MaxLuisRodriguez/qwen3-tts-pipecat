@@ -642,13 +642,13 @@ class TalkerMegakernelBackend:
             effective_decode_stride = max(1, int(decode_stride))
             first_chunk_frames = max(1, int(os.getenv("QWEN3_TTS_FIRST_CHUNK_FRAMES", "1")))
             adaptive_decode_cadence = os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1"
-            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "2")))
-            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "4")))
+            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "8")))
+            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "16")))
             decode_stride_late_start_frame = int(
                 os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24")
             )
             incremental_left_context_frames = max(
-                0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "25"))
+                0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "12"))
             )
             silence_early_stop = os.getenv("QWEN3_TTS_SILENCE_EARLY_STOP", "0") == "1"
             silence_rms = float(os.getenv("QWEN3_TTS_SILENCE_RMS", "0.003"))

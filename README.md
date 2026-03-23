@@ -1,201 +1,171 @@
 # RTX 5090 Decode Megakernel -> Qwen3-TTS on Pipecat
 
-This repo wires AlpinDale's `qwen_megakernel` decode path into a Pipecat voice pipeline:
+This repo adapts AlpinDale's `qwen_megakernel` decode kernel to run the Qwen3-TTS talker decoder inside a local Pipecat voice pipeline:
 
-- `STT (Deepgram) -> LLM (Megakernel service) -> TTS (Qwen3-TTS talker + megakernel backend) -> Daily audio output`
+`Deepgram STT -> Megakernel LLM service -> Local Qwen3-TTS talker service -> Daily audio output`
 
-It is designed around the take-home scope:
+The take-home prompt that guided this work is preserved in [project_instructions.md](/root/qwen3-tts-pipecat/project_instructions.md).
 
-- Adapt megakernel for Qwen3-TTS talker decode
-- Expose streaming inference services
-- Integrate with Pipecat + Daily
-- Measure TTFC/RTF/tokens-per-second with reproducible scripts
+## What Is Working
 
-## Repository Layout
+- Local RTX 5090 megakernel LLM service on `:8000`
+- Local Qwen3-TTS talker service on `:8001`
+- Daily Pipecat room bot with streamed PCM audio
+- Decode-time audio streaming to Pipecat without full-utterance buffering
+- End-to-end voice turns with live terminal metrics
 
-- `kernel/`: CUDA + Python extension for megakernel decode
-- `services/llm_megakernel/`: FastAPI LLM streaming service (`/generate`)
-- `services/tts_qwen3/`: FastAPI streaming TTS service (`/synthesize_binary`)
-- `pipecat_demo/`: voice bot app for Daily room conversation
-- `scripts/bootstrap_qwen_megakernel.sh`: environment + extension bootstrap
-- `scripts/run_local.sh`: start local stack + Pipecat demo
-- `scripts/benchmark_stack.py`: service-level LLM/TTS benchmark client
-- `scripts/benchmark_roundtrip.py`: Pipecat end-to-end turn metric parser
-- `scripts/quick_bench_once.sh`: one-shot service-level benchmark runner
-- `scripts/quick_bench_roundtrip.sh`: one-shot Pipecat round-trip benchmark runner
-- `scripts/quick_bench_sweep.sh`: short/medium/long benchmark sweep
+The pipeline is now stable enough for normal short voice turns. The main remaining gap is performance: TTFC and especially RTF are still above the stretch targets from the prompt.
 
-## Requirements
+## Key Integration Decisions
 
-- Linux host with NVIDIA GPU (target: RTX 5090, `sm_120`)
-- NVIDIA driver + CUDA toolchain available (`nvidia-smi`, `nvcc`)
-- Python 3.11 (managed by bootstrap in `kernel/.venv`)
-- API keys:
-  - `DEEPGRAM_API_KEY`
-  - `DAILY_ROOM_URL` + `DAILY_ROOM_TOKEN` or `DAILY_API_KEY`
+### 1. Kept the original service boundaries
 
-## Build
+- LLM service: [services/llm_megakernel/server.py](/root/qwen3-tts-pipecat/services/llm_megakernel/server.py)
+- TTS service: [services/tts_qwen3/server.py](/root/qwen3-tts-pipecat/services/tts_qwen3/server.py)
+- Pipecat app: [pipecat_demo/app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py)
 
-From repo root:
+That keeps the stack easy to benchmark and debug without changing the user-facing pipeline.
+
+### 2. Added a talker-specific megakernel path
+
+The original megakernel was text decode oriented. This repo adds a Qwen3-TTS talker adapter in [services/tts_qwen3/megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py) and new bindings in [kernel/csrc/torch_bindings.cpp](/root/qwen3-tts-pipecat/kernel/csrc/torch_bindings.cpp).
+
+Important kernel-side changes:
+
+- hidden-state decode entrypoint for talker continuation
+- hidden-only decode path so the next codec token can be chosen from the correct normalized hidden state
+- reuse of the original fused decode kernel structure instead of rewriting the architecture
+
+### 3. Kept streaming decode-time audio
+
+The TTS service still streams PCM while the utterance is being generated:
+
+- no full-waveform fallback path is used in the active pipeline
+- Pipecat consumes the HTTP stream incrementally
+- the speech tokenizer decode is stateful/incremental within a request
+
+### 4. Hardened short-turn stability without changing providers
+
+The repo now includes:
+
+- safer text normalization before TTS
+- repetition/degeneration guards in the local talker path
+- candidate-based speech stabilization inside the same local backend
+- warmup/preload support for the first turn
+
+No external TTS fallback was added to make the bot appear better than the local stack really is.
+
+## Repo Layout
+
+- [kernel/](/root/qwen3-tts-pipecat/kernel): CUDA extension and Python bindings
+- [services/llm_megakernel/](/root/qwen3-tts-pipecat/services/llm_megakernel): FastAPI SSE LLM service
+- [services/tts_qwen3/](/root/qwen3-tts-pipecat/services/tts_qwen3): FastAPI streaming TTS service
+- [pipecat_demo/](/root/qwen3-tts-pipecat/pipecat_demo): Daily/Pipecat voice bot
+- [scripts/bootstrap_qwen_megakernel.sh](/root/qwen3-tts-pipecat/scripts/bootstrap_qwen_megakernel.sh): bootstrap/runtime setup
+- [scripts/run_local.sh](/root/qwen3-tts-pipecat/scripts/run_local.sh): one-command local demo
+- [scripts/benchmark_stack.py](/root/qwen3-tts-pipecat/scripts/benchmark_stack.py): service-level benchmark
+- [scripts/benchmark_roundtrip.py](/root/qwen3-tts-pipecat/scripts/benchmark_roundtrip.py): parses Pipecat turn metrics
+- [scripts/quick_bench_once.sh](/root/qwen3-tts-pipecat/scripts/quick_bench_once.sh): one-shot local benchmark
+- [scripts/quick_bench_sweep.sh](/root/qwen3-tts-pipecat/scripts/quick_bench_sweep.sh): short/medium/long benchmark sweep
+
+## Setup
+
+### 1. Bootstrap
 
 ```bash
 cp -n .env.qwen_megakernel.template .env.qwen_megakernel
 bash scripts/bootstrap_qwen_megakernel.sh
 ```
 
-Notes:
+Bootstrap creates `kernel/.venv`, seeds `pip`, installs the validated runtime, resolves model weights, and builds the megakernel extension.
 
-- Bootstrap creates `kernel/.venv`, installs deps, resolves model weights, and JIT-builds the extension.
-- Bootstrap seeds `pip` explicitly and pins the validated `torch` / `torchaudio` / `triton` runtime baseline for RTX 5090 + `cu128`.
-- Keep `QWEN_MEGAKERNEL_MODEL_NAME` set to the intended Qwen backbone in `.env.qwen_megakernel`.
+### 2. Runtime config
 
-## Configure Runtime
+Create a Pipecat runtime env from the new template:
 
-Edit `.env.pipecat`:
+```bash
+cp -n .env.pipecat.template .env.pipecat
+```
 
-- `DEEPGRAM_API_KEY=...`
-- Either:
-  - `DAILY_ROOM_URL=...` and `DAILY_ROOM_TOKEN=...`
-  - or `DAILY_API_KEY=...`
+Fill in:
 
-Optional tuning knobs are already documented in `.env.pipecat` (TTS cadence, token budgeting, guards).
+- `DEEPGRAM_API_KEY`
+- either `DAILY_API_KEY`
+- or `DAILY_ROOM_URL` plus `DAILY_ROOM_TOKEN`
 
-### Voice Reliability Defaults (Current)
-
-- Streaming remains decode-time only (no full-audio fallback path).
-- Pipecat sanitizes assistant text before TTS:
-  - numbers are normalized to words (`42` -> `forty two`)
-  - punctuation is stripped from spoken output text
-- TTS silent-prefix behavior in `services/tts_qwen3/server.py` is non-fatal by default:
-  - `QWEN3_TTS_REQUIRE_NON_SILENT_PREFIX=0` (default) streams anyway if early chunks are low-energy
-  - set `QWEN3_TTS_REQUIRE_NON_SILENT_PREFIX=1` to restore strict rejection
-
-## Run and Talk with the Model
-
-From repo root:
+### 3. Run the full stack
 
 ```bash
 START_TTS_SERVICE=1 bash scripts/run_local.sh
 ```
 
-When the app prints:
+When the terminal prints the Daily room URL, join from a browser and speak.
 
-```text
-[pipecat] Join this Daily room: <url>
-```
+## Benchmarking
 
-open that URL in your browser and speak.  
-Stop with `Ctrl+C` in the terminal running `run_local.sh`.
-
-## Architecture Decisions and Kernel Integration
-
-1. Kept service boundaries explicit:
-   - LLM service: `services/llm_megakernel/server.py`
-   - TTS service: `services/tts_qwen3/server.py`
-2. Added talker-specific megakernel adapter:
-   - `services/tts_qwen3/megakernel_talker.py`
-3. Ensured TTS output is streamed as decode progresses:
-   - incremental frame decode -> PCM chunk streaming, no full-utterance buffer
-4. Added Pipecat-side response stabilization and chunking:
-   - `pipecat_demo/app.py`
-
-## Quick Benchmark Scripts
-
-### 1) Single quick service benchmark
+### Service-level quick check
 
 ```bash
 bash scripts/quick_bench_once.sh
 ```
 
-Behavior:
-
-- Uses running services if healthy
-- Otherwise starts local LLM/TTS services temporarily
-- Runs `scripts/benchmark_stack.py` and saves JSON to `/tmp/qwen_bench_once_<timestamp>.json`
-- Reports service-level timings only; it does not claim STT/Daily/browser end-to-end latency
-
-Useful env overrides:
-
-```bash
-LLM_URL=http://127.0.0.1:8000 \
-TTS_URL=http://127.0.0.1:8001 \
-BENCH_TTS_MAX_NEW_TOKENS=256 \
-BENCH_TIMEOUT_S=600 \
-bash scripts/quick_bench_once.sh
-```
-
-### 2) End-to-end Pipecat round-trip benchmark
-
-```bash
-bash scripts/quick_bench_roundtrip.sh
-```
-
-Behavior:
-
-- Starts `scripts/run_local.sh` into a log file unless `START_STACK=0`
-- Prints the Daily room URL
-- Waits for one complete spoken turn and parses the emitted:
-  - `[metrics][roundtrip]`
-  - `[metrics][stream]`
-  - `[metrics][quality]`
-- Saves JSON to `/tmp/qwen_roundtrip_<timestamp>.json`
-
-Keep the stack up after the first captured turn:
-
-```bash
-KEEP_STACK_RUNNING=1 bash scripts/quick_bench_roundtrip.sh
-```
-
-### 3) Multi-case sweep (short/medium/long)
+### Sweep
 
 ```bash
 bash scripts/quick_bench_sweep.sh
 ```
 
-Behavior:
-
-- Runs 3 benchmark cases with different utterance lengths
-- Emits per-case JSON plus `summary.json`
-- Output directory defaults to `/tmp/qwen_bench_sweep_<timestamp>/`
-
-Override output directory:
+### End-to-end Pipecat turn parsing
 
 ```bash
-BENCH_SWEEP_OUT_DIR=/tmp/my_bench_sweep bash scripts/quick_bench_sweep.sh
+bash scripts/quick_bench_roundtrip.sh
 ```
 
-## Metrics and Measurement Definitions
+## Current Best-Known Measurements
 
-Service-level metrics from `scripts/benchmark_stack.py`:
+These are the latest service-level numbers from this repo after the final audit, using the tuned decode cadence and benchmark streaming read size:
 
-- `llm.decode_tok_s = token_count / (t_end - t_first_token)`
-- `tts.first_chunk_ms = (t_first_chunk - t_request_start) * 1000`
-- `tts.audio_s = bytes_received / (24000 * 2)`
-- `tts.rtf = tts_total_seconds / tts.audio_s`
-- `service_pipeline_estimate_ms = llm.ttft_ms + tts.first_chunk_ms`
+- Short case:
+  - `header_ttfc_ms ~= 162.6`
+  - `tts_rtf ~= 1.48`
+- Medium case:
+  - `header_ttfc_ms ~= 165.1`
+  - `tts_rtf ~= 1.08`
+- Long case:
+  - `header_ttfc_ms ~= 117.0`
+  - `tts_rtf ~= 3.92`
 
-Backend TTS also exposes `X-TTFC-Ms`, measured server-side and returned in benchmark output as `header_ttfc_ms`.
+Sweep artifact:
 
-End-to-end turn metrics from `scripts/benchmark_roundtrip.py`:
+- [/tmp/qwen_bench_sweep_20260323_043310/summary.json](/tmp/qwen_bench_sweep_20260323_043310/summary.json)
 
-- `overall_ms`
-- `llm_tok_s`
-- `ttfc_ms`
-- `rtf`
-- `mode`
-- `frame_by_frame`
-- `audio_ok`
+Interpretation:
 
-## Deliverables Mapping
+- The local LLM side is no longer the main blocker.
+- The remaining performance miss is mostly on the talker/audio side.
+- TTFC is still well above the prompt target, though stable enough for a demo.
+- RTF remains far above target, especially on longer utterances.
 
-- Working build/run flow on one machine: yes (bootstrap + run_local)
-- Architecture/kernels documented: yes (this README + source files)
-- Quick benchmark methodology and scripts: yes (`quick_bench_once.sh`, `quick_bench_roundtrip.sh`, `quick_bench_sweep.sh`)
-- Short engineering note: see `README_BENCHMARK_NOTES.md`
+## Why The Targets Are Still Missed
+
+The repo now has a stable and honest local stack, but the remaining bottlenecks are real:
+
+1. Talker prefill is still expensive.
+2. Speech tokenizer decode, even incrementally, is still a major steady-state cost.
+3. Some short-turn reliability logic still trades latency for robustness.
+4. Long-form talker generation is much less efficient than the raw Qwen3 megakernel text decode path.
+
+This is why the repo can feel smooth in short conversations while still missing the take-home RTF target in formal measurement.
+
+## Submission Notes
+
+- The take-home prompt asked for one informative README: this file is intended to be that document.
+- The original prompt is preserved in [project_instructions.md](/root/qwen3-tts-pipecat/project_instructions.md).
+- Additional measurement notes are in [README_BENCHMARK_NOTES.md](/root/qwen3-tts-pipecat/README_BENCHMARK_NOTES.md).
 
 ## References
 
-- Blog: `blog.alpindale.net/posts/5090_decode_optimization/`
-- Source: `github.com/AlpinDale/qwen_megakernel`
+- AlpinDale blog: `blog.alpindale.net/posts/5090_decode_optimization/`
+- `qwen_megakernel`: `github.com/AlpinDale/qwen_megakernel`
 - Pipecat docs: `docs.pipecat.ai`
 - Qwen3-TTS: `huggingface.co/Qwen/Qwen3-TTS`

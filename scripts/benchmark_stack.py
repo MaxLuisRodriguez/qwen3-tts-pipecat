@@ -80,7 +80,13 @@ def benchmark_llm(base_url: str, prompt: str, max_tokens: int, timeout_s: int) -
     )
 
 
-def benchmark_tts(base_url: str, text: str, max_new_tokens: int, timeout_s: int) -> TTSMetrics:
+def benchmark_tts(
+    base_url: str,
+    text: str,
+    max_new_tokens: int,
+    timeout_s: int,
+    read_chunk_bytes: int,
+) -> TTSMetrics:
     start = time.perf_counter()
     first_chunk_time = None
     bytes_total = 0
@@ -98,7 +104,7 @@ def benchmark_tts(base_url: str, text: str, max_new_tokens: int, timeout_s: int)
                 header_ttfc = float(response.headers["x-ttfc-ms"])
             except ValueError:
                 header_ttfc = None
-        for chunk in response.iter_content(chunk_size=8192):
+        for chunk in response.iter_content(chunk_size=read_chunk_bytes):
             if not chunk:
                 continue
             if first_chunk_time is None:
@@ -132,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         default="This is a short benchmark utterance for measuring local Qwen three TTS latency.",
     )
     parser.add_argument("--tts-max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--tts-read-chunk-bytes",
+        type=int,
+        default=960,
+        help="Client-side HTTP streaming read size for /synthesize_binary.",
+    )
     parser.add_argument("--timeout-s", type=int, default=600)
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON only.")
     return parser.parse_args()
@@ -140,7 +152,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     llm = benchmark_llm(args.llm_url, args.llm_prompt, args.llm_max_tokens, args.timeout_s)
-    tts = benchmark_tts(args.tts_url, args.tts_text, args.tts_max_new_tokens, args.timeout_s)
+    tts = benchmark_tts(
+        args.tts_url,
+        args.tts_text,
+        args.tts_max_new_tokens,
+        args.timeout_s,
+        args.tts_read_chunk_bytes,
+    )
 
     # Service-only additive estimate for "LLM first token -> TTS first chunk".
     # This excludes STT, Daily transport, and browser playback. Use
