@@ -39,8 +39,8 @@ DECODE_STRIDE = int(os.getenv("QWEN3_TTS_DECODE_STRIDE", "1"))
 
 def _decode_stride_header_value() -> str:
     if os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1":
-        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "12")))
-        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "24")))
+        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "16")))
+        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "32")))
         late_start = int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24"))
         left_context = max(0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "12")))
         return f"adaptive(mid={mid},late={late}@{late_start},ctx={left_context})"
@@ -559,158 +559,34 @@ async def synthesize_stream_binary(request: TTSRequest):
     """Stream raw PCM audio chunks (16-bit mono @ 24kHz)."""
     request_started = time.perf_counter()
     audio_iter: Iterator[np.ndarray] | None = None
-    first_audio: np.ndarray | None = None
     stats = None
     effective_max_new_tokens = request.max_new_tokens
     last_error: str | None = None
-    selected_text = request.text
+    candidate_texts = _speech_stabilization_candidates(request.text)
+    selected_text = candidate_texts[0] if candidate_texts else request.text
+    selected_candidate_index = 0
+    text_stabilized = selected_text != request.text
     max_attempts = max(1, int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_MAX_ATTEMPTS", "2")))
     retry_token_bump = int(os.getenv("QWEN3_TTS_PRIMARY_STREAM_RETRY_TOKEN_BUMP", "24"))
-    non_silent_peek_chunks = int(os.getenv("QWEN3_TTS_NON_SILENT_PEEK_CHUNKS", "1"))
-    strict_non_silent_peek_chunks = int(
-        os.getenv("QWEN3_TTS_STRICT_NON_SILENT_PEEK_CHUNKS", "12")
-    )
-    max_prefix_silence_s = float(os.getenv("QWEN3_TTS_MAX_PREFIX_SILENCE_S", "0.8"))
-    strict_max_prefix_silence_s = float(
-        os.getenv("QWEN3_TTS_STRICT_MAX_PREFIX_SILENCE_S", "1.6")
-    )
-    non_silent_rms = float(os.getenv("QWEN3_TTS_NON_SILENT_RMS", "0.0015"))
-    require_non_silent_prefix = os.getenv("QWEN3_TTS_REQUIRE_NON_SILENT_PREFIX", "0") == "1"
-    candidate_texts = _speech_stabilization_candidates(request.text)
-    selected_candidate_index = 0
-
-    for candidate_index, candidate_text in enumerate(candidate_texts):
-        for attempt in range(max_attempts):
-            attempt_max_new_tokens = min(8192, request.max_new_tokens + attempt * retry_token_bump)
-            try:
-                stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
-                    text=candidate_text,
-                    voice=request.voice,
-                    max_new_tokens=attempt_max_new_tokens,
-                )
-                peek_chunks = non_silent_peek_chunks
-                max_prefix_samples = int(max_prefix_silence_s * SAMPLE_RATE)
-                if _prefers_strict_prefix_probe(candidate_text) or candidate_index > 0:
-                    peek_chunks = max(peek_chunks, strict_non_silent_peek_chunks)
-                    max_prefix_samples = max(
-                        max_prefix_samples,
-                        int(strict_max_prefix_silence_s * SAMPLE_RATE),
-                    )
-
-                if peek_chunks <= 0:
-                    first_audio = next(audio_iter, None)
-                    if first_audio is None or first_audio.size == 0:
-                        _close_iter_safely(audio_iter)
-                        audio_iter = None
-                        last_error = "Model returned no audio chunks from decode-time stream."
-                        continue
-                    selected_text = candidate_text
-                    selected_candidate_index = candidate_index
-                    break
-
-                prefix, has_non_silent = _peek_audio_prefix(
-                    audio_iter,
-                    max_chunks=peek_chunks,
-                    max_prefix_samples=max_prefix_samples,
-                    rms_threshold=non_silent_rms,
-                )
-                if not prefix:
-                    _close_iter_safely(audio_iter)
-                    audio_iter = None
-                    last_error = "Model returned no audio chunks from decode-time stream."
-                    continue
-
-                if has_non_silent:
-                    while len(prefix) > 1 and _is_effectively_silent(prefix[0], non_silent_rms):
-                        prefix.pop(0)
-                    first_audio = _trim_leading_silence(prefix[0], non_silent_rms)
-                    if first_audio.size == 0 and len(prefix) > 1:
-                        prefix.pop(0)
-                        first_audio = prefix[0]
-                    audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
-                    selected_text = candidate_text
-                    selected_candidate_index = candidate_index
-                    break
-
-                LOGGER.warning(
-                    "Leading decode-time audio remained silent for the initial prefix "
-                    "(candidate %d/%d, attempt %d/%d).",
-                    candidate_index + 1,
-                    len(candidate_texts),
-                    attempt + 1,
-                    max_attempts,
-                )
-                _close_iter_safely(audio_iter)
-                audio_iter = None
-                last_error = "Leading decode-time audio chunks were effectively silent."
-                continue
-            except Exception as exc:
-                if audio_iter is not None:
-                    _close_iter_safely(audio_iter)
-                    audio_iter = None
-                last_error = f"Primary decode-time stream failed: {exc}"
-                if attempt < max_attempts - 1:
-                    continue
-                LOGGER.exception("TTS /synthesize_binary primary stream failed")
-        if first_audio is not None and audio_iter is not None and stats is not None:
+    for attempt in range(max_attempts):
+        attempt_max_new_tokens = min(8192, request.max_new_tokens + attempt * retry_token_bump)
+        try:
+            stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
+                text=selected_text,
+                voice=request.voice,
+                max_new_tokens=attempt_max_new_tokens,
+            )
             break
-
-    if (
-        (first_audio is None or audio_iter is None or stats is None)
-        and not require_non_silent_prefix
-        and candidate_texts
-    ):
-        # Final fallback within the same local decode-time streaming backend:
-        # if all stabilization candidates stayed silent, preserve previous
-        # behavior and stream the original request immediately.
-        candidate_text = candidate_texts[0]
-        for attempt in range(max_attempts):
-            attempt_max_new_tokens = min(8192, request.max_new_tokens + attempt * retry_token_bump)
-            try:
-                stats, audio_iter, effective_max_new_tokens = engine.stream_synthesize(
-                    text=candidate_text,
-                    voice=request.voice,
-                    max_new_tokens=attempt_max_new_tokens,
-                )
-                peek_chunks = non_silent_peek_chunks
-                max_prefix_samples = int(max_prefix_silence_s * SAMPLE_RATE)
-                if _prefers_strict_prefix_probe(candidate_text):
-                    peek_chunks = max(peek_chunks, strict_non_silent_peek_chunks)
-                    max_prefix_samples = max(
-                        max_prefix_samples,
-                        int(strict_max_prefix_silence_s * SAMPLE_RATE),
-                    )
-
-                if peek_chunks <= 0:
-                    first_audio = next(audio_iter, None)
-                else:
-                    prefix, _ = _peek_audio_prefix(
-                        audio_iter,
-                        max_chunks=peek_chunks,
-                        max_prefix_samples=max_prefix_samples,
-                        rms_threshold=non_silent_rms,
-                    )
-                    if prefix:
-                        first_audio = _trim_leading_silence(prefix[0], non_silent_rms)
-                        if first_audio.size == 0 and len(prefix) > 1:
-                            prefix.pop(0)
-                            first_audio = prefix[0]
-                        audio_iter = _prepend_audio_iter(prefix[1:], audio_iter)
-                if first_audio is not None and first_audio.size > 0:
-                    selected_text = candidate_text
-                    selected_candidate_index = 0
-                    LOGGER.info(
-                        "Streaming decode-time audio despite silent prefix after exhausting stabilization candidates."
-                    )
-                    break
+        except Exception as exc:
+            if audio_iter is not None:
                 _close_iter_safely(audio_iter)
                 audio_iter = None
-            except Exception:
-                if audio_iter is not None:
-                    _close_iter_safely(audio_iter)
-                    audio_iter = None
+            last_error = f"Primary decode-time stream failed: {exc}"
+            if attempt < max_attempts - 1:
+                continue
+            LOGGER.exception("TTS /synthesize_binary primary stream failed")
 
-    if first_audio is None or audio_iter is None or stats is None:
+    if audio_iter is None or stats is None:
         raise HTTPException(
             status_code=500,
             detail=last_error or "Model returned no usable audio from decode-time stream.",
@@ -729,9 +605,9 @@ async def synthesize_stream_binary(request: TTSRequest):
         "X-Max-New-Tokens-Effective": str(effective_max_new_tokens),
         "X-Decode-Stride": _decode_stride_header_value(),
         "X-Stop-Reason": getattr(stats, "stop_reason", "unknown"),
-        "X-Text-Stabilized": "1" if selected_candidate_index > 0 else "0",
+        "X-Text-Stabilized": "1" if text_stabilized else "0",
     }
-    if selected_candidate_index > 0:
+    if text_stabilized:
         LOGGER.info(
             "TTS speech stabilization selected candidate %d/%d: %r -> %r",
             selected_candidate_index + 1,
@@ -740,7 +616,7 @@ async def synthesize_stream_binary(request: TTSRequest):
             selected_text,
         )
     return StreamingResponse(
-        _iter_pcm_chunks_from_audio_stream(_merged_audio_iter(first_audio, audio_iter)),
+        _iter_pcm_chunks_from_audio_stream(audio_iter),
         media_type="audio/pcm",
         headers=headers,
     )

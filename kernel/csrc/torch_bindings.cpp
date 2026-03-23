@@ -149,6 +149,35 @@ void decode_hidden_only(
       c10::cuda::getCurrentCUDAStream().stream());
 }
 
+void decode_hidden_fp32_head(
+    torch::Tensor output_token, torch::Tensor input_hidden,
+    torch::Tensor layer_weights_packed, torch::Tensor final_norm_weight,
+    torch::Tensor lm_head_weight_f32, torch::Tensor cos_table,
+    torch::Tensor sin_table, torch::Tensor k_cache, torch::Tensor v_cache,
+    torch::Tensor hidden_buffer, torch::Tensor activations,
+    torch::Tensor residual, torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor attn_out, torch::Tensor mlp_intermediate,
+    torch::Tensor normalized, int64_t num_layers, int64_t position,
+    int64_t max_seq_len, double attn_scale) {
+  launch_ldg_decode_hidden_only_direct(
+      input_hidden.data_ptr(),
+      reinterpret_cast<const LDGLayerWeights *>(
+          layer_weights_packed.data_ptr()),
+      final_norm_weight.data_ptr(), cos_table.data_ptr(), sin_table.data_ptr(),
+      k_cache.data_ptr(), v_cache.data_ptr(), hidden_buffer.data_ptr(),
+      activations.data_ptr(), residual.data_ptr(), q.data_ptr(), k.data_ptr(),
+      v.data_ptr(), attn_out.data_ptr(), mlp_intermediate.data_ptr(),
+      normalized.data_ptr(), static_cast<int>(num_layers),
+      static_cast<int>(position), static_cast<int>(max_seq_len),
+      static_cast<float>(attn_scale),
+      c10::cuda::getCurrentCUDAStream().stream());
+
+  auto logits = at::mv(lm_head_weight_f32, normalized);
+  auto max_result = logits.max(0, false);
+  auto idx = std::get<1>(max_result).to(torch::kInt32);
+  output_token.copy_(idx);
+}
+
 extern "C" void launch_ldg_generate_nosync(
     int first_token_id, int num_steps, const void *embed_weight,
     const LDGLayerWeights *layer_weights, const void *final_norm_weight,
@@ -232,6 +261,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "int num_layers, int position, int max_seq_len, "
           "float attn_scale) -> ()");
   ops.impl("decode_hidden_only", torch::kCUDA, &decode_hidden_only);
+
+  ops.def("decode_hidden_fp32_head(Tensor output_token, Tensor input_hidden, "
+          "Tensor layer_weights_packed, Tensor final_norm_weight, "
+          "Tensor lm_head_weight_f32, Tensor cos_table, Tensor sin_table, "
+          "Tensor k_cache, Tensor v_cache, "
+          "Tensor hidden_buffer, Tensor activations, Tensor residual, "
+          "Tensor q, Tensor k, Tensor v, Tensor attn_out, "
+          "Tensor mlp_intermediate, Tensor normalized, "
+          "int num_layers, int position, int max_seq_len, "
+          "float attn_scale) -> ()");
+  ops.impl("decode_hidden_fp32_head", torch::kCUDA, &decode_hidden_fp32_head);
 
   ops.def("generate_nosync(int first_token_id, int num_steps, "
           "Tensor embed_weight, Tensor layer_weights_packed, "

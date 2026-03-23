@@ -149,6 +149,7 @@ class TalkerMegakernelBackend:
 
         self._decode_from_hidden = torch.ops.qwen_megakernel_C.decode_from_hidden
         self._decode_hidden_only = torch.ops.qwen_megakernel_C.decode_hidden_only
+        self._decode_hidden_fp32_head = torch.ops.qwen_megakernel_C.decode_hidden_fp32_head
         self._qwen = qwen_tts_model
         self._model = qwen_tts_model.model
         self._talker = self._model.talker
@@ -302,6 +303,9 @@ class TalkerMegakernelBackend:
         self._bmax_vals = torch.empty(4096, **f32)
         self._bmax_idxs = torch.empty(4096, dtype=torch.int32, device=self._device)
         self._out_token = torch.empty(1, dtype=torch.int32, device=self._device)
+        self._token_buf = torch.empty(1, dtype=torch.long, device=self._device)
+        self._past_hidden_buf = torch.empty((1, 1, self._hidden_size), **bf16)
+        self._subtalker_prefill_buf = torch.empty((1, 2, self._hidden_size), **bf16)
 
     def _reset_runtime(self) -> None:
         self._k_cache.zero_()
@@ -601,9 +605,11 @@ class TalkerMegakernelBackend:
         frame_codes[0] = first_token.view(-1)[0]
         codec_sum = first_hidden.clone()
 
+        self._subtalker_prefill_buf[:, :1].copy_(past_hidden)
+        self._subtalker_prefill_buf[:, 1:2].copy_(first_hidden)
         outputs = self._subtalker_model(
             input_ids=None,
-            inputs_embeds=self._subtalker_projection(torch.cat((past_hidden, first_hidden), dim=1)),
+            inputs_embeds=self._subtalker_projection(self._subtalker_prefill_buf),
             past_key_values=None,
             use_cache=True,
             output_attentions=False,
@@ -625,7 +631,7 @@ class TalkerMegakernelBackend:
             frame_codes[group_idx + 1] = next_token[0]
 
             next_embed = self._subtalker_input_embeddings[group_idx](next_token.view(1, 1))
-            codec_sum = codec_sum + next_embed
+            codec_sum.add_(next_embed)
 
             if group_idx + 1 >= self._num_subtalker_steps:
                 break
@@ -659,8 +665,8 @@ class TalkerMegakernelBackend:
             effective_decode_stride = max(1, int(decode_stride))
             first_chunk_frames = max(1, int(os.getenv("QWEN3_TTS_FIRST_CHUNK_FRAMES", "1")))
             adaptive_decode_cadence = os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1"
-            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "12")))
-            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "24")))
+            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "16")))
+            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "32")))
             decode_stride_late_start_frame = int(
                 os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24")
             )
@@ -750,7 +756,8 @@ class TalkerMegakernelBackend:
                             stats.stop_reason = "eos"
                             break
 
-                    next_first = torch.tensor([next_token], device=self._device, dtype=torch.long)
+                    self._token_buf[0] = next_token
+                    next_first = self._token_buf
                     first_hidden = self._talker.get_input_embeddings()(next_first.unsqueeze(0))
                     frame_codes, codec_sum = self._predict_subtalker_frame(
                         first_token=next_first,
@@ -794,10 +801,12 @@ class TalkerMegakernelBackend:
                     else:
                         input_embed = input_embed + tts_pad_embed
 
-                    self._decode_hidden_only(
+                    self._decode_hidden_fp32_head(
+                        self._out_token,
                         input_embed[0, 0].to(torch.bfloat16).contiguous(),
                         self._layer_weights_packed,
                         self._final_norm_weight,
+                        self._lm_head_weight_f32,
                         self._cos_table,
                         self._sin_table,
                         self._k_cache,
@@ -817,8 +826,10 @@ class TalkerMegakernelBackend:
                         self._attn_scale,
                     )
 
-                    next_first = self._argmax_next_codec_token()
-                    past_hidden = self._norm_out.view(1, 1, -1).to(self._dtype)
+                    self._token_buf.copy_(self._out_token)
+                    next_first = self._token_buf
+                    self._past_hidden_buf.copy_(self._norm_out.view(1, 1, -1))
+                    past_hidden = self._past_hidden_buf
                     generation_step += 1
 
                     should_decode = False

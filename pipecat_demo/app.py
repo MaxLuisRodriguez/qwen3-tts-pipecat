@@ -1150,7 +1150,7 @@ async def main():
     qwen_tts_sample_rate = int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
     qwen_tts_max_new_tokens = int(os.getenv("QWEN3_TTS_MAX_NEW_TOKENS", "512"))
     allow_interruptions = os.getenv("PIPECAT_ALLOW_INTERRUPTIONS", "0") == "1"
-    stt_end_of_speech_wait_s = float(os.getenv("PIPECAT_STT_END_OF_SPEECH_WAIT_S", "0.8"))
+    stt_end_of_speech_wait_s = float(os.getenv("PIPECAT_STT_END_OF_SPEECH_WAIT_S", "0.35"))
 
     daily_session = await _resolve_daily_session()
     print(f"[pipecat] Join this Daily room: {daily_session.room_url}")
