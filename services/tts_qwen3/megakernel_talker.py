@@ -183,6 +183,10 @@ class TalkerMegakernelBackend:
         # streamed incrementally once decode begins.
         self._non_streaming_text_mode = os.getenv("QWEN3_TTS_NON_STREAMING_TEXT_MODE", "1") == "1"
         self._prompt_scaffold_cache: dict[tuple[str, str, bool], dict[str, torch.Tensor]] = {}
+        self._projected_text_cache: dict[str, torch.Tensor] = {}
+        self._projected_text_cache_limit = int(
+            os.getenv("QWEN3_TTS_PROJECTED_TEXT_CACHE_SIZE", "64")
+        )
 
         self._layer_weights_packed = self._pack_layer_weights()
         self._final_norm_weight = self._talker.model.norm.weight.contiguous()
@@ -366,14 +370,30 @@ class TalkerMegakernelBackend:
         self._prompt_scaffold_cache[key] = cached
         return cached
 
+    def _get_projected_text_hidden(self, text: str) -> torch.Tensor:
+        cached = self._projected_text_cache.get(text)
+        if cached is not None:
+            return cached
+
+        processor = self._qwen.processor
+        wrapped = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        input_ids = processor(text=wrapped, return_tensors="pt", padding=True)["input_ids"].to(self._device)
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        projected = self._talker.text_projection(
+            self._talker.get_text_embeddings()(input_ids[:, 3:-5])
+        ).contiguous()
+
+        if self._projected_text_cache_limit > 0:
+            if len(self._projected_text_cache) >= self._projected_text_cache_limit:
+                oldest_key = next(iter(self._projected_text_cache))
+                self._projected_text_cache.pop(oldest_key, None)
+            self._projected_text_cache[text] = projected
+        return projected
+
     def _build_custom_voice_prompt(
         self, text: str, speaker: str, language: str = "auto"
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        processor = self._qwen.processor
-        text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        input_ids = processor(text=text, return_tensors="pt", padding=True)["input_ids"].to(self._device)
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
         non_streaming_text_mode = self._non_streaming_text_mode
         talker_cfg = self._model.config.talker_config
         scaffold = self._get_prompt_scaffold(speaker, language, non_streaming_text_mode)
@@ -381,23 +401,23 @@ class TalkerMegakernelBackend:
         tts_eos_embed = scaffold["tts_eos_embed"]
         tts_pad_embed = scaffold["tts_pad_embed"]
         codec_embed_tail = scaffold["codec_embed_tail"]
+        projected_text_hidden = self._get_projected_text_hidden(text)
 
         if non_streaming_text_mode:
-            text_hidden = self._talker.text_projection(self._talker.get_text_embeddings()(input_ids[:, 3:-5]))
             codec_pad_ids = torch.tensor(
-                [[talker_cfg.codec_pad_id] * (text_hidden.shape[1] + 1)],
+                [[talker_cfg.codec_pad_id] * (projected_text_hidden.shape[1] + 1)],
                 device=self._device,
-                dtype=input_ids.dtype,
+                dtype=torch.long,
             )
             codec_bos_ids = torch.tensor(
                 [[talker_cfg.codec_bos_id]],
                 device=self._device,
-                dtype=input_ids.dtype,
+                dtype=torch.long,
             )
             talker_input_embed = torch.cat(
                 [
                     talker_input_embed,
-                    torch.cat((text_hidden, tts_eos_embed), dim=1)
+                    torch.cat((projected_text_hidden, tts_eos_embed), dim=1)
                     + self._talker.get_input_embeddings()(codec_pad_ids),
                     tts_pad_embed + self._talker.get_input_embeddings()(codec_bos_ids),
                 ],
@@ -405,16 +425,13 @@ class TalkerMegakernelBackend:
             )
             trailing_text_hidden = tts_pad_embed
         else:
-            first_text = (
-                self._talker.text_projection(self._talker.get_text_embeddings()(input_ids[:, 3:4]))
-                + codec_embed_tail
-            )
+            first_text = projected_text_hidden[:, :1] + codec_embed_tail
             talker_input_embed = torch.cat([talker_input_embed, first_text], dim=1)
             trailing_text_hidden = torch.cat(
-                (self._talker.text_projection(self._talker.get_text_embeddings()(input_ids[:, 4:-5])), tts_eos_embed),
+                (projected_text_hidden[:, 1:], tts_eos_embed),
                 dim=1,
             )
-        return talker_input_embed, trailing_text_hidden, tts_pad_embed
+        return talker_input_embed.contiguous(), trailing_text_hidden.contiguous(), tts_pad_embed.contiguous()
 
     def _make_incremental_audio_decoder(self):
         if os.getenv("QWEN3_TTS_USE_INCREMENTAL_TOKENIZER_DECODER", "1") != "1":
@@ -642,8 +659,8 @@ class TalkerMegakernelBackend:
             effective_decode_stride = max(1, int(decode_stride))
             first_chunk_frames = max(1, int(os.getenv("QWEN3_TTS_FIRST_CHUNK_FRAMES", "1")))
             adaptive_decode_cadence = os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1"
-            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "8")))
-            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "16")))
+            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "12")))
+            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "24")))
             decode_stride_late_start_frame = int(
                 os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24")
             )
@@ -660,6 +677,9 @@ class TalkerMegakernelBackend:
             min_eos_steps_short = int(os.getenv("QWEN3_TTS_MIN_EOS_STEPS_SHORT", "2"))
             min_frames_before_repeat_stop = int(
                 os.getenv("QWEN3_TTS_MIN_FRAMES_BEFORE_REPEAT_STOP", "32")
+            )
+            min_frames_before_repeat_stop_short = int(
+                os.getenv("QWEN3_TTS_MIN_FRAMES_BEFORE_REPEAT_STOP_SHORT", "20")
             )
             repeat_first_token_run_limit = int(
                 os.getenv("QWEN3_TTS_REPEAT_FIRST_TOKEN_RUN_LIMIT", "48")
@@ -698,17 +718,26 @@ class TalkerMegakernelBackend:
                 talker_cfg = self._model.config.talker_config
                 eos_id = int(talker_cfg.codec_eos_token_id)
                 bos_id = int(talker_cfg.codec_bos_id)
-                effective_min_eos_steps = (
-                    min_eos_steps_short if self._text_is_short_utterance(text) else min_eos_steps
+                is_short_utterance = self._text_is_short_utterance(text)
+                effective_min_eos_steps = min_eos_steps_short if is_short_utterance else min_eos_steps
+                effective_min_frames_before_repeat_stop = (
+                    min_frames_before_repeat_stop_short
+                    if is_short_utterance
+                    else min_frames_before_repeat_stop
                 )
 
                 emitted_samples = 0
                 decoded_frames = 0
                 trailing_silence_samples = 0
-                frames: list[torch.Tensor] = []
+                with torch.inference_mode(False):
+                    frame_buffer = torch.empty(
+                        (max_new_tokens, self._num_code_groups),
+                        dtype=torch.long,
+                        device=self._device,
+                    )
+                frame_count = 0
                 prev_first_token: int | None = None
                 repeated_first_token_run = 0
-                prev_frame_codes: torch.Tensor | None = None
                 repeated_frame_run = 0
                 stats.stop_reason = "max_new_tokens"
                 for step in range(max_new_tokens):
@@ -739,13 +768,13 @@ class TalkerMegakernelBackend:
                         repeated_first_token_run = 1
                     prev_first_token = next_token
 
-                    if prev_frame_codes is not None and torch.equal(frame_codes, prev_frame_codes):
+                    if frame_count > 0 and torch.equal(frame_codes, frame_buffer[frame_count - 1]):
                         repeated_frame_run += 1
                     else:
                         repeated_frame_run = 1
 
                     guard_repeat = (
-                        len(frames) >= min_frames_before_repeat_stop
+                        frame_count >= effective_min_frames_before_repeat_stop
                         and generation_step >= trailing_text_hidden.shape[1]
                     )
                     if guard_repeat:
@@ -756,8 +785,8 @@ class TalkerMegakernelBackend:
                             stats.stop_reason = "repeat_token_loop"
                             break
 
-                    frames.append(frame_codes)
-                    prev_frame_codes = frame_codes.clone()
+                    frame_buffer[frame_count].copy_(frame_codes.detach())
+                    frame_count += 1
 
                     input_embed = codec_sum
                     if generation_step < trailing_text_hidden.shape[1]:
@@ -793,7 +822,7 @@ class TalkerMegakernelBackend:
                     generation_step += 1
 
                     should_decode = False
-                    n_frames = len(frames)
+                    n_frames = frame_count
                     current_decode_stride = effective_decode_stride
                     if adaptive_decode_cadence:
                         if n_frames >= decode_stride_late_start_frame:
@@ -807,28 +836,28 @@ class TalkerMegakernelBackend:
 
                     if should_decode:
                         if incremental_audio_decoder is not None:
-                            new_frame_count = len(frames) - decoded_frames
+                            new_frame_count = frame_count - decoded_frames
                             if new_frame_count > 0:
-                                new_audio_codes = torch.stack(frames[decoded_frames:], dim=0)
+                                new_audio_codes = frame_buffer[decoded_frames:frame_count]
                                 delta_t = incremental_audio_decoder.decode_new_frames(new_audio_codes)
                                 delta = np.asarray(
                                     delta_t.detach().cpu().numpy(),
                                     dtype=np.float32,
                                 ).reshape(-1).copy()
                                 sr = self._sample_rate
-                                decoded_frames = len(frames)
+                                decoded_frames = frame_count
                             else:
                                 delta = np.empty((0,), dtype=np.float32)
                                 sr = self._sample_rate
                         else:
                             delta, sr, decoded_frames = self._decode_incremental_suffix(
-                                frames,
+                                [frame_buffer[idx] for idx in range(frame_count)],
                                 decoded_frames=decoded_frames,
                                 left_context_frames=incremental_left_context_frames,
                             )
                         if delta.size > 0:
                             emitted_samples += delta.shape[0]
-                            stats.frames_generated = len(frames)
+                            stats.frames_generated = frame_count
                             if stats.ttfc_ms is None:
                                 ended.record()
                                 torch.cuda.synchronize()
@@ -852,28 +881,28 @@ class TalkerMegakernelBackend:
                                     stats.stop_reason = "silence_tail"
                                     break
 
-                if frames:
+                if frame_count > 0:
                     if incremental_audio_decoder is not None:
-                        new_frame_count = len(frames) - decoded_frames
+                        new_frame_count = frame_count - decoded_frames
                         if new_frame_count > 0:
-                            new_audio_codes = torch.stack(frames[decoded_frames:], dim=0)
+                            new_audio_codes = frame_buffer[decoded_frames:frame_count]
                             delta_t = incremental_audio_decoder.decode_new_frames(new_audio_codes)
                             delta = np.asarray(
                                 delta_t.detach().cpu().numpy(),
                                 dtype=np.float32,
                             ).reshape(-1).copy()
                             sr = self._sample_rate
-                            decoded_frames = len(frames)
+                            decoded_frames = frame_count
                         else:
                             delta = np.empty((0,), dtype=np.float32)
                             sr = self._sample_rate
                     else:
                         delta, sr, decoded_frames = self._decode_incremental_suffix(
-                            frames,
+                            [frame_buffer[idx] for idx in range(frame_count)],
                             decoded_frames=decoded_frames,
                             left_context_frames=incremental_left_context_frames,
                         )
-                    stats.frames_generated = len(frames)
+                    stats.frames_generated = frame_count
                     if delta.size > 0:
                         emitted_samples += delta.shape[0]
                         if stats.ttfc_ms is None:
