@@ -15,7 +15,7 @@ The take-home prompt that guided this work is preserved in [project_instructions
 - Binary TTS path now pushes chunks to Pipecat immediately as they are decoded
 - End-to-end voice turns with live terminal metrics
 
-The pipeline is now stable enough for normal short voice turns. The main remaining gap is performance: TTFC and especially RTF are still above the stretch targets from the prompt.
+The pipeline is now stable enough for normal short voice turns. The main remaining gap is performance: TTFC and RTF are still above stretch targets.
 
 ## Key Integration Decisions
 
@@ -305,11 +305,6 @@ This is why the repo can feel smooth in short conversations while still missing 
   - reported via the live Pipecat metric lines and [scripts/benchmark_roundtrip.py](/root/qwen3-tts-pipecat/scripts/benchmark_roundtrip.py)
 - Demo recording:
   - not stored in the repo; attach separately as an out-of-repo submission artifact
-
-## Submission Notes
-
-- The take-home prompt asked for one informative README: this file is intended to be that document.
-- The original prompt is preserved in [project_instructions.md](/root/qwen3-tts-pipecat/project_instructions.md).
 
 ## References
 
