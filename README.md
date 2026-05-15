@@ -255,6 +255,7 @@ Runtime:
 - `flash-attn==2.8.3`
 - TTS attention implementation: `flash_attention_2`
 - benchmark env: `QWEN3_TTS_ANTI_CHEAT=1`, `QWEN3_TTS_SYNC_TIMING=0`
+- prefill optimization: `QWEN3_TTS_PREFILL_OPTIMIZED=1`, `QWEN3_TTS_PREFILL_KERNEL=0`, `QWEN3_TTS_PREWARM_BACKENDS=1`
 - decode cadence: `adaptive(mid=4,late=8@24,ctx=25)`
 - scheduler mode: `scheduler_scalar`
 - kernel path reported by service: `qwen_megakernel_C.decode_hidden_fp32_head`
@@ -271,14 +272,24 @@ Parity/sanity check:
 - optimized/base RMS relative delta: `0.0021`
 - optimized/base peak relative delta: `0.3006`
 
-Phase timing from the same short parity run with `QWEN3_TTS_SYNC_TIMING=1`:
+Phase timing from the same short parity run with `QWEN3_TTS_SYNC_TIMING=1` and the safe prefill path:
 
-- prefill: `220.7 ms`
-- subtalker/code predictor: `1259.6 ms`
-- talker custom-kernel decode: `33.5 ms`
-- speech tokenizer/audio decode: `281.9 ms`
+- prefill: `219.8 ms` on the first backend request
+- prompt build: `139.7 ms`
+- PyTorch prefill model: `79.4 ms`
+- prefill KV copy: `0.7 ms`
+- subtalker/code predictor: `1250.1 ms`
+- talker custom-kernel decode: `33.6 ms`
+- speech tokenizer/audio decode: `287.7 ms`
 - frames generated: `22`
 - emitted audio: `1.76 s`
+
+Warm same-backend prefill check:
+
+- first request: `235.5 ms` prefill (`151.8 ms` prompt build + `83.0 ms` model)
+- second request: `23.8 ms` prefill (`0.7 ms` prompt build + `22.4 ms` model)
+- explanation: `QWEN3_TTS_PREFILL_OPTIMIZED=1` caches only request-independent speaker/language scaffold tensors per backend slot. It does not cache projected request text, generated tokens, or audio.
+- experimental result: `QWEN3_TTS_PREFILL_KERNEL=1` reduced short-prompt prefill to about `166 ms` in the end-to-end parity run, but full utterance parity failed because generation drifted and hit `max_new_tokens`; it is therefore kept off by default.
 
 Jittered concurrent TTS benchmark artifacts:
 
@@ -286,6 +297,12 @@ Jittered concurrent TTS benchmark artifacts:
 - [benchmark_results/concurrency_2_after_instrumentation.json](/root/qwen3-tts-pipecat/benchmark_results/concurrency_2_after_instrumentation.json)
 - [benchmark_results/concurrency_4_after_instrumentation.json](/root/qwen3-tts-pipecat/benchmark_results/concurrency_4_after_instrumentation.json)
 - [benchmark_results/concurrency_8_after_instrumentation.json](/root/qwen3-tts-pipecat/benchmark_results/concurrency_8_after_instrumentation.json)
+- [benchmark_results/prefill_opt_c1.json](/root/qwen3-tts-pipecat/benchmark_results/prefill_opt_c1.json)
+- [benchmark_results/prefill_opt_c2.json](/root/qwen3-tts-pipecat/benchmark_results/prefill_opt_c2.json)
+- [benchmark_results/prefill_opt_c4.json](/root/qwen3-tts-pipecat/benchmark_results/prefill_opt_c4.json)
+- [benchmark_results/prefill_opt_c8.json](/root/qwen3-tts-pipecat/benchmark_results/prefill_opt_c8.json)
+
+Previous 8-request benchmark, before the prefill/scaffold prewarm pass:
 
 | concurrency | successful | max active observed | TTFC p90 / p99 ms | RTF p50 / p99 | max chunk gap p99 ms | GPU avg / max util |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -294,12 +311,28 @@ Jittered concurrent TTS benchmark artifacts:
 | 4 | 8/8 | 4 | `494.7 / 514.1` | `3.246 / 3.954` | `2527.3` | `18.4% / 24.0%` |
 | 8 | 8/8 | 8 client streams | `12792.1 / 14616.0` | `3.988 / 7.320` | `2547.6` | `17.7% / 24.0%` |
 
+After the prefill/scaffold prewarm pass, 32-request benchmark:
+
+| concurrency | successful | max active observed | TTFC p90 / p99 ms | RTF p50 / p99 | max chunk gap p99 ms | GPU avg / max util |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32/32 | 1 | `111.4 / 267.8` | `0.781 / 0.892` | `593.6` | `9.0% / 23.0%` |
+| 2 | 32/32 | 2 | `207.8 / 231.0` | `1.207 / 1.571` | `1036.4` | `14.8% / 25.0%` |
+| 4 | 32/32 | 4 | `482.4 / 513.0` | `2.641 / 3.638` | `2625.8` | `18.6% / 26.0%` |
+| 8 | 32/32 | 8 client streams | `13810.6 / 16368.3` | `5.955 / 8.678` | `2500.9` | `18.3% / 24.0%` |
+
+Apples-to-apples 8-request concurrency-4 check after prefill optimization:
+
+- TTFC p90/p99: `444.7 / 457.2 ms`
+- RTF p50/p99: `3.141 / 3.440`
+- max chunk gap p99: `2581.6 ms`
+- result: p90/p99 TTFC improved, RTF improved modestly, chunk gaps remain far above target.
+
 Interpretation:
 
 - Single-stream TTFC is now good, but single-stream RTF still misses the `<= 0.5` target.
-- Concurrency 4 reaches four active scalar backend slots and p90 TTFC is just under `500 ms`, but p99 TTFC and RTF miss the target.
+- Concurrency 4 reaches four active scalar backend slots and p90 TTFC is under `500 ms`, but RTF and chunk gaps miss the target.
 - Concurrency 8 is not a true eight-slot server run. The server defaults to `QWEN3_TTS_MAX_ACTIVE_REQUESTS=4`, so the benchmark's eight client streams include queue wait.
-- Low GPU utilization plus the phase timings point to Python/PyTorch subtalker and audio decode work as the current top bottlenecks, not the custom talker decode kernel.
+- Low GPU utilization plus the phase timings point to Python/PyTorch subtalker work as the current top bottleneck, not prefill or the custom talker decode kernel.
 - This is not a completed true batch-4 CUDA submission yet. It is an honest scheduler-level concurrency implementation with measurement, parity checks, and a clear bottleneck report.
 
 ## How TTFC And RTF Were Calculated
@@ -361,12 +394,31 @@ The repo now has a stable and honest local stack, but the remaining bottlenecks 
 
 1. Subtalker/code predictor execution is the largest measured short-turn cost.
 2. Speech tokenizer decode, even incrementally, is still a major steady-state cost.
-3. Talker prefill is still a meaningful TTFC cost.
+3. Talker prefill is improved for warm backend slots, but PyTorch prefill is still used for correctness.
 4. The current multi-request path uses scheduler-level scalar backend slots; true batched CUDA decode is still future work.
 5. Some short-turn reliability logic still trades latency for robustness.
 6. Long-form talker generation is much less efficient than the raw Qwen3 megakernel text decode path.
 
 This explains why the system feels smooth during short interactions while still missing the take-home RTF target under formal measurement.
+
+### Empirical note: audio decode overlap is implemented but does not move the needle
+
+An audio-decode-overlap path is wired into [services/tts_qwen3/megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py) and is opt-in via `QWEN3_TTS_AUDIO_DECODE_OVERLAP=1`. It runs the incremental tokenizer decode on a dedicated CUDA stream from a worker thread, pinning that thread to its own `IncrementalTokenizerDecoderV2` state. Output audio is bit-identical to the serial path (RMS / peak / prefix-correlation match in `check_tts_parity.py`).
+
+Direct backend benchmark on the warm path (`vivian` voice, `english`, `max_new_tokens=64`):
+
+| text | mode | wall_total_s | TTFC ms | max chunk gap ms | RTF | subtalker_ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| ready | overlap | 1.41 | 162.9 | 248.7 | 0.80 | 1330.6 |
+| ready | serial  | 1.37 |  92.8 | 244.5 | 0.78 | 1252.7 |
+| the city is tehran | overlap | 1.90 | 153.9 | 271.6 | 0.79 | 1801.8 |
+| the city is tehran | serial  | 1.85 |  92.4 | 302.2 | 0.77 | 1705.5 |
+| performance benchmark testing | overlap | 3.52 | 157.2 | 482.5 | 0.78 | 3386.3 |
+| performance benchmark testing | serial  | 3.44 |  92.4 | 475.7 | 0.77 | 3241.4 |
+
+Subtalker dominates per-frame wall time (~60 ms / frame) while audio decode contributes only ~12 ms / frame averaged. Even with perfect overlap, the savings are bounded by audio-decode time, which is ~6% of total wall. The overlap path also pays a first-chunk delay of one extra subtalker iteration (it cannot yield the first chunk until at least one drain), which regresses TTFC by ~60-70 ms.
+
+Conclusion: the audio decode overlap is **correct** but **not a measurable win**. The default is `QWEN3_TTS_AUDIO_DECODE_OVERLAP=0`. The real next-step optimization target is subtalker execution itself (CUDA graphs, kernel fusion, or speculative decoding).
 
 ## Deliverables Mapping
 

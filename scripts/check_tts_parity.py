@@ -142,6 +142,10 @@ def main() -> None:
             "frames_generated": stats.frames_generated,
             "stop_reason": stats.stop_reason,
             "prefill_ms": stats.prefill_ms,
+            "prompt_build_ms": stats.prompt_build_ms,
+            "prefill_model_ms": stats.prefill_model_ms,
+            "prefill_cache_ms": stats.prefill_cache_ms,
+            "prefill_mode": stats.prefill_mode,
             "subtalker_ms": stats.subtalker_ms,
             "talker_decode_ms": stats.talker_decode_ms,
             "audio_decode_ms": stats.audio_decode_ms,
@@ -152,6 +156,8 @@ def main() -> None:
             "first_decode_ms": stats.first_decode_ms,
             "kernel_path": stats.kernel_path,
             "timing_mode": stats.timing_mode,
+            "audio_decode_overlap": stats.audio_decode_overlap,
+            "audio_decode_wait_ms": stats.audio_decode_wait_ms,
         },
         "kernel_first_step_parity": None,
         "official": None,
@@ -162,6 +168,7 @@ def main() -> None:
             "rms_within_tolerance": None,
             "peak_within_tolerance": None,
             "prefix_correlation_within_tolerance": None,
+            "kernel_prefill_token_match": None,
             "kernel_first_step_token_match": None,
         },
     }
@@ -173,6 +180,8 @@ def main() -> None:
             language=args.language,
         )
         result["kernel_first_step_parity"] = parity
+        if parity.get("kernel_prefill_token_match") is not None:
+            result["checks"]["kernel_prefill_token_match"] = bool(parity.get("kernel_prefill_token_match"))
         result["checks"]["kernel_first_step_token_match"] = bool(parity.get("token_match"))
 
     if not args.skip_official:

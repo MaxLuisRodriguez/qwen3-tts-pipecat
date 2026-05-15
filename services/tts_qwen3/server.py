@@ -275,6 +275,10 @@ class TTSRequestScheduler:
                 "frames_generated",
                 "stop_reason",
                 "prefill_ms",
+                "prompt_build_ms",
+                "prefill_model_ms",
+                "prefill_cache_ms",
+                "prefill_mode",
                 "subtalker_ms",
                 "talker_decode_ms",
                 "audio_decode_ms",
@@ -285,6 +289,8 @@ class TTSRequestScheduler:
                 "first_decode_ms",
                 "kernel_path",
                 "timing_mode",
+                "audio_decode_overlap",
+                "audio_decode_wait_ms",
             ):
                 if hasattr(raw_stats, attr):
                     setattr(state.stats, attr, getattr(raw_stats, attr))
@@ -294,7 +300,9 @@ class TTSRequestScheduler:
             LOGGER.info(
                 "TTS request completed id=%s mode=%s batch_admit=%s ttfc_ms=%s "
                 "generation_s=%.3f audio_s=%.3f frames=%s chunks=%s "
-                "prefill_ms=%.2f subtalker_ms=%.2f talker_decode_ms=%.2f audio_decode_ms=%.2f",
+                "prefill_mode=%s prefill_ms=%.2f prompt_ms=%.2f prefill_model_ms=%.2f "
+                "prefill_cache_ms=%.2f subtalker_ms=%.2f talker_decode_ms=%.2f audio_decode_ms=%.2f "
+                "audio_decode_overlap=%s",
                 state.request_id,
                 self.mode,
                 state.batch_admit_size,
@@ -303,10 +311,15 @@ class TTSRequestScheduler:
                 float(getattr(state.stats, "audio_seconds", 0.0) or 0.0),
                 getattr(state.stats, "frames_generated", None),
                 getattr(state.stats, "audio_chunks", None),
+                getattr(state.stats, "prefill_mode", "unknown"),
                 float(getattr(state.stats, "prefill_ms", 0.0) or 0.0),
+                float(getattr(state.stats, "prompt_build_ms", 0.0) or 0.0),
+                float(getattr(state.stats, "prefill_model_ms", 0.0) or 0.0),
+                float(getattr(state.stats, "prefill_cache_ms", 0.0) or 0.0),
                 float(getattr(state.stats, "subtalker_ms", 0.0) or 0.0),
                 float(getattr(state.stats, "talker_decode_ms", 0.0) or 0.0),
                 float(getattr(state.stats, "audio_decode_ms", 0.0) or 0.0),
+                bool(getattr(state.stats, "audio_decode_overlap", False)),
             )
         except BaseException as exc:
             state.error = exc
@@ -339,6 +352,7 @@ class Qwen3TTSEngine:
         self._backend_lock = threading.Lock()
         self._backend_pool: "queue.LifoQueue[TalkerMegakernelBackend]" = queue.LifoQueue()
         self._backend_count = 0
+        self._prewarm_backends = os.getenv("QWEN3_TTS_PREWARM_BACKENDS", "1") == "1"
         self._generate_lock = threading.Lock()
         self._generate_lock_timeout_s = float(
             os.getenv("QWEN3_TTS_GENERATE_LOCK_TIMEOUT_S", "180")
@@ -371,9 +385,20 @@ class Qwen3TTSEngine:
             self._model.model.eval()
             if self._device.type != "cuda":
                 self._model.model.to(self._device)
-            self._backend = TalkerMegakernelBackend(self._model)
-            self._backend_pool.put(self._backend)
-            self._backend_count = 1
+            target_backends = self._scheduler.max_active if self._prewarm_backends else 1
+            for idx in range(target_backends):
+                backend = TalkerMegakernelBackend(self._model)
+                backend.warm_prefill_scaffold(self.default_voice, self.default_language)
+                if idx == 0:
+                    self._backend = backend
+                self._backend_pool.put(backend)
+                self._backend_count += 1
+            LOGGER.info(
+                "Loaded Qwen3-TTS with %d backend slot(s), prewarm_backends=%s, prefill_optimized=%s",
+                self._backend_count,
+                self._prewarm_backends,
+                os.getenv("QWEN3_TTS_PREFILL_OPTIMIZED", "1") == "1",
+            )
 
     def checkout_backend(self) -> TalkerMegakernelBackend:
         self.load()
@@ -389,7 +414,9 @@ class Qwen3TTSEngine:
             if self._backend_count < self._scheduler.max_active:
                 self._backend_count += 1
                 try:
-                    return TalkerMegakernelBackend(self._model)
+                    backend = TalkerMegakernelBackend(self._model)
+                    backend.warm_prefill_scaffold(self.default_voice, self.default_language)
+                    return backend
                 except Exception:
                     self._backend_count -= 1
                     raise
@@ -905,6 +932,11 @@ async def health():
         "attn_implementation": engine.attn_implementation,
         "scheduler_mode": engine._scheduler.mode,
         "max_active_requests": engine._scheduler.max_active,
+        "prefill_optimized": os.getenv("QWEN3_TTS_PREFILL_OPTIMIZED", "1") == "1",
+        "prefill_kernel": os.getenv("QWEN3_TTS_PREFILL_KERNEL", "0") == "1",
+        "prefill_mode": "pytorch_static_scaffold_by_default",
+        "prewarm_backends": engine._prewarm_backends,
+        "backend_slots_loaded": engine._backend_count,
     }
 
 
@@ -923,6 +955,13 @@ async def spec():
         "batching_note": "scheduler-level scalar backend slots; CUDA talker decode is not yet a true batched kernel",
         "default_voice": engine.default_voice,
         "attn_implementation": engine.attn_implementation,
+        "prefill_optimized": os.getenv("QWEN3_TTS_PREFILL_OPTIMIZED", "1") == "1",
+        "prefill_kernel": os.getenv("QWEN3_TTS_PREFILL_KERNEL", "0") == "1",
+        "prefill_mode": "pytorch_static_scaffold_by_default",
+        "prefill_kernel_max_seq_len": int(os.getenv("QWEN3_TTS_PREFILL_KERNEL_MAX_SEQ_LEN", "96")),
+        "prefill_graph": os.getenv("QWEN3_TTS_PREFILL_GRAPH", "0") == "1",
+        "prewarm_backends": engine._prewarm_backends,
+        "backend_slots_loaded": engine._backend_count,
         "decode_stride": _decode_stride_header_value(),
         "incremental_left_context_frames": int(
             os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "25")

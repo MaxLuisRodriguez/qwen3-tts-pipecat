@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
+import queue
 import struct
+import threading
 import time
 from dataclasses import dataclass
 from typing import Iterator
@@ -22,6 +25,10 @@ class StreamStats:
     frames_generated: int = 0
     stop_reason: str = "unknown"
     prefill_ms: float = 0.0
+    prompt_build_ms: float = 0.0
+    prefill_model_ms: float = 0.0
+    prefill_cache_ms: float = 0.0
+    prefill_mode: str = "pytorch"
     subtalker_ms: float = 0.0
     talker_decode_ms: float = 0.0
     audio_decode_ms: float = 0.0
@@ -32,6 +39,8 @@ class StreamStats:
     first_decode_ms: float | None = None
     kernel_path: str = "qwen_megakernel_C.decode_hidden_fp32_head"
     timing_mode: str = "wall_async"
+    audio_decode_overlap: bool = False
+    audio_decode_wait_ms: float = 0.0
 
 
 class IncrementalTokenizerDecoderV2:
@@ -201,6 +210,12 @@ class TalkerMegakernelBackend:
         self._projected_text_cache_limit = int(
             os.getenv("QWEN3_TTS_PROJECTED_TEXT_CACHE_SIZE", "64")
         )
+        self._prefill_optimized = os.getenv("QWEN3_TTS_PREFILL_OPTIMIZED", "1") == "1"
+        self._prefill_kernel = os.getenv("QWEN3_TTS_PREFILL_KERNEL", "0") == "1"
+        self._prefill_graph = os.getenv("QWEN3_TTS_PREFILL_GRAPH", "0") == "1"
+        self._prefill_kernel_max_seq_len = int(
+            os.getenv("QWEN3_TTS_PREFILL_KERNEL_MAX_SEQ_LEN", "96")
+        )
 
         self._layer_weights_packed = self._pack_layer_weights()
         self._final_norm_weight = self._talker.model.norm.weight.contiguous()
@@ -369,7 +384,7 @@ class TalkerMegakernelBackend:
         self, speaker: str, language: str, non_streaming_text_mode: bool
     ) -> dict[str, torch.Tensor]:
         key = (speaker.lower(), language.lower(), bool(non_streaming_text_mode))
-        if not self._anti_cheat_mode():
+        if self._prefill_optimized or not self._anti_cheat_mode():
             cached = self._prompt_scaffold_cache.get(key)
             if cached is not None:
                 return cached
@@ -426,9 +441,16 @@ class TalkerMegakernelBackend:
             "tts_pad_embed": tts_pad_embed.contiguous(),
             "codec_embed_tail": codec_embed[:, -1:].contiguous(),
         }
-        if not self._anti_cheat_mode():
+        if self._prefill_optimized or not self._anti_cheat_mode():
             self._prompt_scaffold_cache[key] = cached
         return cached
+
+    def warm_prefill_scaffold(self, speaker: str, language: str = "auto") -> None:
+        """Populate request-independent prompt scaffold tensors for a backend slot."""
+        if not self._prefill_optimized:
+            return
+        with torch.inference_mode():
+            self._get_prompt_scaffold(speaker, language, self._non_streaming_text_mode)
 
     def _get_projected_text_hidden(self, text: str) -> torch.Tensor:
         if not self._anti_cheat_mode():
@@ -606,6 +628,13 @@ class TalkerMegakernelBackend:
     def _sync_timing_enabled() -> bool:
         return os.getenv("QWEN3_TTS_SYNC_TIMING", "0") == "1"
 
+    def _kernel_prefill_enabled_for(self, seq_len: int) -> bool:
+        return (
+            self._prefill_kernel
+            and seq_len > 0
+            and seq_len <= self._prefill_kernel_max_seq_len
+        )
+
     @staticmethod
     def _phase_start(sync_timing: bool) -> float:
         if sync_timing and torch.cuda.is_available():
@@ -617,6 +646,126 @@ class TalkerMegakernelBackend:
         if sync_timing and torch.cuda.is_available():
             torch.cuda.synchronize()
         return (time.perf_counter() - started_at) * 1000.0
+
+    def _run_megakernel_prefill(self, talker_input_embed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Replay short prompt embeddings through the scalar megakernel decode path.
+
+        This is a real prefill path: it fills the same KV cache used by
+        continuation decode and returns the first codec token from the final
+        prompt hidden state. It does not cache request outputs or audio.
+        """
+        seq_len = int(talker_input_embed.shape[1])
+        if seq_len <= 0:
+            raise ValueError("Cannot run megakernel prefill for an empty prompt.")
+        if seq_len > self._max_seq_len:
+            raise ValueError(f"Prompt length {seq_len} exceeds max_seq_len {self._max_seq_len}.")
+
+        for position in range(seq_len):
+            input_hidden = talker_input_embed[0, position].to(torch.bfloat16).contiguous()
+            if position == seq_len - 1:
+                self._decode_hidden_fp32_head(
+                    self._out_token,
+                    input_hidden,
+                    self._layer_weights_packed,
+                    self._final_norm_weight,
+                    self._lm_head_weight_f32,
+                    self._cos_table,
+                    self._sin_table,
+                    self._k_cache,
+                    self._v_cache,
+                    self._hidden,
+                    self._act,
+                    self._res,
+                    self._q,
+                    self._k,
+                    self._v,
+                    self._attn_out,
+                    self._mlp_inter,
+                    self._norm_out,
+                    self._num_layers,
+                    position,
+                    self._max_seq_len,
+                    self._attn_scale,
+                )
+            else:
+                self._decode_hidden_only(
+                    input_hidden,
+                    self._layer_weights_packed,
+                    self._final_norm_weight,
+                    self._cos_table,
+                    self._sin_table,
+                    self._k_cache,
+                    self._v_cache,
+                    self._hidden,
+                    self._act,
+                    self._res,
+                    self._q,
+                    self._k,
+                    self._v,
+                    self._attn_out,
+                    self._mlp_inter,
+                    self._norm_out,
+                    self._num_layers,
+                    position,
+                    self._max_seq_len,
+                    self._attn_scale,
+                )
+
+        self._token_buf[0] = self._out_token[0]
+        self._past_hidden_buf.copy_(self._norm_out.view(1, 1, -1))
+        return self._token_buf, self._past_hidden_buf
+
+    def _run_pytorch_prefill(
+        self,
+        talker_input_embed: torch.Tensor,
+        *,
+        sync_timing: bool,
+        stats: StreamStats | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        started = self._phase_start(sync_timing)
+        prefill = self._talker.model(
+            inputs_embeds=talker_input_embed,
+            use_cache=True,
+            return_dict=True,
+        )
+        elapsed = self._phase_ms(started, sync_timing)
+        if stats is not None:
+            stats.prefill_model_ms += elapsed
+
+        next_first = torch.argmax(self._talker.codec_head(prefill.last_hidden_state[:, -1, :]), dim=-1).to(
+            torch.long
+        )
+        seq_len = int(talker_input_embed.shape[1])
+        copy_started = self._phase_start(sync_timing)
+        self._copy_prefill_cache(prefill.past_key_values, seq_len)
+        copy_elapsed = self._phase_ms(copy_started, sync_timing)
+        if stats is not None:
+            stats.prefill_cache_ms += copy_elapsed
+            stats.prefill_mode = "pytorch_static_scaffold" if self._prefill_optimized else "pytorch"
+        return next_first, prefill.last_hidden_state[:, -1:, :]
+
+    def _run_prefill(
+        self,
+        talker_input_embed: torch.Tensor,
+        *,
+        sync_timing: bool,
+        stats: StreamStats,
+    ) -> tuple[torch.Tensor, int, torch.Tensor]:
+        seq_len = int(talker_input_embed.shape[1])
+        if self._kernel_prefill_enabled_for(seq_len):
+            started = self._phase_start(sync_timing)
+            next_first, past_hidden = self._run_megakernel_prefill(talker_input_embed)
+            elapsed = self._phase_ms(started, sync_timing)
+            stats.prefill_model_ms += elapsed
+            stats.prefill_mode = "megakernel_scalar"
+            return next_first, seq_len, past_hidden
+
+        next_first, past_hidden = self._run_pytorch_prefill(
+            talker_input_embed,
+            sync_timing=sync_timing,
+            stats=stats,
+        )
+        return next_first, seq_len, past_hidden
 
     def debug_first_step_parity(
         self,
@@ -669,6 +818,23 @@ class TalkerMegakernelBackend:
             baseline_logits = torch.mv(self._lm_head_weight_f32, baseline_hidden[0])
             baseline_token = int(torch.argmax(baseline_logits).item())
 
+            kernel_prefill_token = None
+            kernel_prefill_hidden_max_diff = None
+            kernel_prefill_hidden_mean_diff = None
+            kernel_prefill_token_match = None
+            if self._kernel_prefill_enabled_for(seq_len):
+                self._reset_runtime()
+                kernel_prefill_first, kernel_prefill_hidden = self._run_megakernel_prefill(talker_input_embed)
+                torch.cuda.synchronize()
+                kernel_prefill_token = int(kernel_prefill_first.view(-1)[0].item())
+                prefill_hidden_diff = (
+                    prefill.last_hidden_state[:, -1:, :].detach().float()
+                    - kernel_prefill_hidden.detach().float()
+                ).abs()
+                kernel_prefill_hidden_max_diff = float(prefill_hidden_diff.max().item())
+                kernel_prefill_hidden_mean_diff = float(prefill_hidden_diff.mean().item())
+                kernel_prefill_token_match = kernel_prefill_token == int(next_first.view(-1)[0].item())
+
             self._copy_prefill_cache(prefill.past_key_values, seq_len)
             self._decode_hidden_fp32_head(
                 self._out_token,
@@ -704,6 +870,10 @@ class TalkerMegakernelBackend:
         return {
             "kernel_path": "qwen_megakernel_C.decode_hidden_fp32_head",
             "first_prefill_token": int(next_first.view(-1)[0].item()),
+            "kernel_prefill_token": kernel_prefill_token,
+            "kernel_prefill_token_match": kernel_prefill_token_match,
+            "kernel_prefill_hidden_max_abs_diff": kernel_prefill_hidden_max_diff,
+            "kernel_prefill_hidden_mean_abs_diff": kernel_prefill_hidden_mean_diff,
             "first_frame_codes": [int(v) for v in frame_codes.detach().cpu().tolist()],
             "baseline_next_token": baseline_token,
             "custom_next_token": custom_token,
@@ -867,32 +1037,106 @@ class TalkerMegakernelBackend:
             incremental_audio_decoder = self._make_incremental_audio_decoder()
             sync_timing = self._sync_timing_enabled()
             stats.timing_mode = "wall_sync" if sync_timing else "wall_async"
+            audio_overlap_enabled = (
+                incremental_audio_decoder is not None
+                and not silence_early_stop
+                and os.getenv("QWEN3_TTS_AUDIO_DECODE_OVERLAP", "0") == "1"
+                and torch.cuda.is_available()
+            )
+            stats.audio_decode_overlap = bool(audio_overlap_enabled)
 
-            with torch.inference_mode():
+            audio_input_q: "queue.Queue[object]" | None = None
+            audio_output_q: "queue.Queue[object]" | None = None
+            audio_worker: threading.Thread | None = None
+            worker_error: list[BaseException] = []
+            if audio_overlap_enabled:
+                audio_stream = torch.cuda.Stream(device=self._device)
+                audio_input_q = queue.Queue()
+                audio_output_q = queue.Queue()
+                decoder_ref = incremental_audio_decoder
+                device_ref = self._device
+
+                def _audio_worker_loop():
+                    try:
+                        with torch.inference_mode():
+                            while True:
+                                payload = audio_input_q.get()
+                                if payload is None:
+                                    break
+                                frames_tensor, ready_event, submit_perf, snapshot_frame_count = payload
+                                audio_stream.wait_event(ready_event)
+                                with torch.cuda.stream(audio_stream):
+                                    delta_t = decoder_ref.decode_new_frames(frames_tensor)
+                                audio_stream.synchronize()
+                                delta = np.asarray(
+                                    delta_t.detach().cpu().numpy(),
+                                    dtype=np.float32,
+                                ).reshape(-1).copy()
+                                audio_output_q.put(
+                                    (delta, submit_perf, time.perf_counter(), snapshot_frame_count)
+                                )
+                    except BaseException as exc:  # pragma: no cover - propagated to main thread
+                        worker_error.append(exc)
+                    finally:
+                        audio_output_q.put(None)
+
+                audio_worker = threading.Thread(
+                    target=_audio_worker_loop,
+                    name="qwen3-tts-audio-decode",
+                    daemon=True,
+                )
+                audio_worker.start()
+
+            wall_start = time.perf_counter()
+            worker_shutdown_done = False
+
+            def _shutdown_audio_worker():
+                nonlocal worker_shutdown_done
+                if worker_shutdown_done or not audio_overlap_enabled:
+                    return
+                worker_shutdown_done = True
+                try:
+                    audio_input_q.put_nowait(None)
+                except Exception:
+                    audio_input_q.put(None)
+                # Drain any pending outputs so the worker can exit cleanly.
+                while True:
+                    try:
+                        item = audio_output_q.get(timeout=5.0)
+                    except Exception:
+                        break
+                    if item is None:
+                        break
+                if audio_worker is not None:
+                    audio_worker.join(timeout=5.0)
+
+            @contextlib.contextmanager
+            def _audio_worker_cleanup_ctx():
+                try:
+                    yield
+                finally:
+                    _shutdown_audio_worker()
+
+            with _audio_worker_cleanup_ctx(), torch.inference_mode():
                 self._reset_runtime()
                 started = torch.cuda.Event(enable_timing=True)
                 ended = torch.cuda.Event(enable_timing=True)
                 started.record()
 
-                prefill_started = self._phase_start(sync_timing)
+                prompt_started = self._phase_start(sync_timing)
                 talker_input_embed, trailing_text_hidden, tts_pad_embed = self._build_custom_voice_prompt(
                     text,
                     speaker,
                     language=language,
                 )
-                prefill = self._talker.model(
-                    inputs_embeds=talker_input_embed,
-                    use_cache=True,
-                    return_dict=True,
-                )
-                stats.prefill_ms += self._phase_ms(prefill_started, sync_timing)
+                stats.prompt_build_ms += self._phase_ms(prompt_started, sync_timing)
 
-                next_first = torch.argmax(self._talker.codec_head(prefill.last_hidden_state[:, -1, :]), dim=-1).to(
-                    torch.long
+                next_first, seq_len, past_hidden = self._run_prefill(
+                    talker_input_embed,
+                    sync_timing=sync_timing,
+                    stats=stats,
                 )
-                seq_len = int(talker_input_embed.shape[1])
-                self._copy_prefill_cache(prefill.past_key_values, seq_len)
-                past_hidden = prefill.last_hidden_state[:, -1:, :]
+                stats.prefill_ms = stats.prompt_build_ms + stats.prefill_model_ms + stats.prefill_cache_ms
                 generation_step = 0
                 talker_cfg = self._model.config.talker_config
                 eos_id = int(talker_cfg.codec_eos_token_id)
@@ -1028,7 +1272,138 @@ class TalkerMegakernelBackend:
                     elif ((n_frames - first_chunk_frames) % current_decode_stride) == 0:
                         should_decode = True
 
-                    if should_decode:
+                    if should_decode and audio_overlap_enabled:
+                        new_frame_count = frame_count - decoded_frames
+                        if new_frame_count > 0:
+                            frames_for_decode = frame_buffer[decoded_frames:frame_count].clone()
+                            ready_event = torch.cuda.Event()
+                            ready_event.record()
+                            decoded_frames = frame_count
+                            stats.audio_decode_calls += 1
+                            audio_input_q.put(
+                                (
+                                    frames_for_decode,
+                                    ready_event,
+                                    time.perf_counter(),
+                                    frame_count,
+                                )
+                            )
+                    if audio_overlap_enabled:
+                        # Drain any ready chunks without blocking on every iteration.
+                        while True:
+                            try:
+                                item = audio_output_q.get_nowait()
+                            except queue.Empty:
+                                break
+                            if item is None:
+                                if worker_error:
+                                    raise worker_error[0]
+                                break
+                            delta, submit_perf, done_perf, snapshot_frame_count = item
+                            stats.audio_decode_ms += (done_perf - submit_perf) * 1000.0
+                            if delta.size > 0:
+                                emitted_samples += delta.shape[0]
+                                stats.audio_chunks += 1
+                                stats.frames_generated = max(
+                                    stats.frames_generated, snapshot_frame_count
+                                )
+                                if stats.ttfc_ms is None:
+                                    stats.ttfc_ms = (time.perf_counter() - wall_start) * 1000.0
+                                yield delta
+                    elif should_decode:
+                            audio_decode_started = self._phase_start(sync_timing)
+                            if incremental_audio_decoder is not None:
+                                new_frame_count = frame_count - decoded_frames
+                                if new_frame_count > 0:
+                                    new_audio_codes = frame_buffer[decoded_frames:frame_count]
+                                    delta_t = incremental_audio_decoder.decode_new_frames(new_audio_codes)
+                                    delta = np.asarray(
+                                        delta_t.detach().cpu().numpy(),
+                                        dtype=np.float32,
+                                    ).reshape(-1).copy()
+                                    sr = self._sample_rate
+                                    decoded_frames = frame_count
+                                else:
+                                    delta = np.empty((0,), dtype=np.float32)
+                                    sr = self._sample_rate
+                            else:
+                                delta, sr, decoded_frames = self._decode_incremental_suffix(
+                                    [frame_buffer[idx] for idx in range(frame_count)],
+                                    decoded_frames=decoded_frames,
+                                    left_context_frames=incremental_left_context_frames,
+                                )
+                            stats.audio_decode_ms += self._phase_ms(audio_decode_started, sync_timing)
+                            stats.audio_decode_calls += 1
+                            if delta.size > 0:
+                                emitted_samples += delta.shape[0]
+                                stats.frames_generated = frame_count
+                                stats.audio_chunks += 1
+                                if stats.ttfc_ms is None:
+                                    ended.record()
+                                    torch.cuda.synchronize()
+                                    stats.ttfc_ms = float(started.elapsed_time(ended))
+                                yield delta
+
+                                if silence_early_stop and n_frames >= min_frames_before_silence_stop:
+                                    silent = np.abs(delta) <= silence_rms
+                                    silent_tail = 0
+                                    for sample_is_silent in silent[::-1]:
+                                        if sample_is_silent:
+                                            silent_tail += 1
+                                        else:
+                                            break
+                                    if silent_tail == delta.shape[0]:
+                                        trailing_silence_samples += silent_tail
+                                    else:
+                                        trailing_silence_samples = silent_tail
+
+                                    if trailing_silence_samples >= int(silence_tail_s * sr):
+                                        stats.stop_reason = "silence_tail"
+                                        break
+
+                if audio_overlap_enabled:
+                    # Submit any final undelivered frames to the worker before joining.
+                    if frame_count > decoded_frames:
+                        frames_for_decode = frame_buffer[decoded_frames:frame_count].clone()
+                        ready_event = torch.cuda.Event()
+                        ready_event.record()
+                        stats.audio_decode_calls += 1
+                        audio_input_q.put(
+                            (
+                                frames_for_decode,
+                                ready_event,
+                                time.perf_counter(),
+                                frame_count,
+                            )
+                        )
+                        decoded_frames = frame_count
+                    audio_input_q.put(None)
+                    wait_started = time.perf_counter()
+                    while True:
+                        item = audio_output_q.get()
+                        if item is None:
+                            break
+                        delta, submit_perf, done_perf, snapshot_frame_count = item
+                        stats.audio_decode_ms += (done_perf - submit_perf) * 1000.0
+                        if delta.size > 0:
+                            emitted_samples += delta.shape[0]
+                            stats.audio_chunks += 1
+                            stats.frames_generated = max(
+                                stats.frames_generated, snapshot_frame_count
+                            )
+                            if stats.ttfc_ms is None:
+                                stats.ttfc_ms = (time.perf_counter() - wall_start) * 1000.0
+                            yield delta
+                    stats.audio_decode_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+                    if worker_error:
+                        raise worker_error[0]
+                    audio_worker.join()
+                    worker_shutdown_done = True
+                    stats.frames_generated = max(stats.frames_generated, frame_count)
+                    stats.audio_seconds = float(emitted_samples) / float(self._sample_rate)
+                    stats.generation_s = time.perf_counter() - wall_start
+                else:
+                    if frame_count > 0:
                         audio_decode_started = self._phase_start(sync_timing)
                         if incremental_audio_decoder is not None:
                             new_frame_count = frame_count - decoded_frames
@@ -1052,70 +1427,19 @@ class TalkerMegakernelBackend:
                             )
                         stats.audio_decode_ms += self._phase_ms(audio_decode_started, sync_timing)
                         stats.audio_decode_calls += 1
+                        stats.frames_generated = frame_count
                         if delta.size > 0:
                             emitted_samples += delta.shape[0]
-                            stats.frames_generated = frame_count
                             stats.audio_chunks += 1
                             if stats.ttfc_ms is None:
                                 ended.record()
                                 torch.cuda.synchronize()
                                 stats.ttfc_ms = float(started.elapsed_time(ended))
                             yield delta
+                        stats.audio_seconds = float(emitted_samples) / float(sr)
 
-                            if silence_early_stop and n_frames >= min_frames_before_silence_stop:
-                                silent = np.abs(delta) <= silence_rms
-                                silent_tail = 0
-                                for sample_is_silent in silent[::-1]:
-                                    if sample_is_silent:
-                                        silent_tail += 1
-                                    else:
-                                        break
-                                if silent_tail == delta.shape[0]:
-                                    trailing_silence_samples += silent_tail
-                                else:
-                                    trailing_silence_samples = silent_tail
-
-                                if trailing_silence_samples >= int(silence_tail_s * sr):
-                                    stats.stop_reason = "silence_tail"
-                                    break
-
-                if frame_count > 0:
-                    audio_decode_started = self._phase_start(sync_timing)
-                    if incremental_audio_decoder is not None:
-                        new_frame_count = frame_count - decoded_frames
-                        if new_frame_count > 0:
-                            new_audio_codes = frame_buffer[decoded_frames:frame_count]
-                            delta_t = incremental_audio_decoder.decode_new_frames(new_audio_codes)
-                            delta = np.asarray(
-                                delta_t.detach().cpu().numpy(),
-                                dtype=np.float32,
-                            ).reshape(-1).copy()
-                            sr = self._sample_rate
-                            decoded_frames = frame_count
-                        else:
-                            delta = np.empty((0,), dtype=np.float32)
-                            sr = self._sample_rate
-                    else:
-                        delta, sr, decoded_frames = self._decode_incremental_suffix(
-                            [frame_buffer[idx] for idx in range(frame_count)],
-                            decoded_frames=decoded_frames,
-                            left_context_frames=incremental_left_context_frames,
-                        )
-                    stats.audio_decode_ms += self._phase_ms(audio_decode_started, sync_timing)
-                    stats.audio_decode_calls += 1
-                    stats.frames_generated = frame_count
-                    if delta.size > 0:
-                        emitted_samples += delta.shape[0]
-                        stats.audio_chunks += 1
-                        if stats.ttfc_ms is None:
-                            ended.record()
-                            torch.cuda.synchronize()
-                            stats.ttfc_ms = float(started.elapsed_time(ended))
-                        yield delta
-                    stats.audio_seconds = float(emitted_samples) / float(sr)
-
-                ended.record()
-                torch.cuda.synchronize()
-                stats.generation_s = float(started.elapsed_time(ended)) / 1000.0
+                    ended.record()
+                    torch.cuda.synchronize()
+                    stats.generation_s = float(started.elapsed_time(ended)) / 1000.0
 
         return stats, _run()

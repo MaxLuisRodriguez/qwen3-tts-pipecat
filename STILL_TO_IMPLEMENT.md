@@ -2,20 +2,21 @@
 
 This document captures the major performance-critical items that are still not implemented in the current Qwen3-TTS + Pipecat integration.
 
-As of the 2026-05-15 validation pass, the repo installs and auto-selects Flash Attention 2 when available, records per-phase TTS timing, and exposes scheduler-level scalar concurrency. The remaining work below is still required before claiming a true batch-4 CUDA submission.
+As of the 2026-05-15 validation pass, the repo installs and auto-selects Flash Attention 2 when available, records per-phase TTS timing, exposes scheduler-level scalar concurrency, and prewarms static prefill scaffolds for backend slots. The remaining work below is still required before claiming a true batch-4 CUDA submission.
 
 Measured short-turn timing with synchronized probes on `text=ready`, `voice=vivian`, `max_new_tokens=64`:
 
-- prefill: `220.7 ms`
-- subtalker/code predictor: `1259.6 ms`
-- talker custom-kernel decode: `33.5 ms`
-- speech tokenizer/audio decode: `281.9 ms`
+- first-request prefill: `219.8 ms`
+- warm same-backend prefill after static scaffold cache: `23.8 ms`
+- subtalker/code predictor: `1250.1 ms`
+- talker custom-kernel decode: `33.6 ms`
+- speech tokenizer/audio decode: `287.7 ms`
 
-The top measured bottleneck is currently the PyTorch subtalker/code predictor path, followed by speech tokenizer/audio decode and prefill. The custom talker decode kernel is being called, but it is no longer the dominant measured cost on this short prompt.
+The top measured bottleneck is currently the PyTorch subtalker/code predictor path, followed by speech tokenizer/audio decode. Warm backend-slot prefill is no longer the dominant short-prompt cost. The custom talker decode kernel is being called, but it is not the dominant measured cost on this short prompt.
 
-## 1. Megakernel talker prefill
+## 1. Exact megakernel talker prefill
 
-Talker prefill is still done through the Hugging Face model path rather than a specialized megakernel prefill path.
+Talker prefill still uses the Hugging Face/PyTorch model path by default for correctness. The repo now caches request-independent speaker/language scaffold tensors and prewarms backend slots, but the actual request text prefill remains PyTorch.
 
 ```python
 # services/tts_qwen3/megakernel_talker.py
@@ -29,9 +30,10 @@ prefill = self._talker.model(
 Source: `services/tts_qwen3/megakernel_talker.py:711`
 
 Why it matters:
-- This prefill path is still a large TTFC cost.
+- This prefill path is still a TTFC cost, especially under load.
 - The fast decode kernel only helps after prefill has completed.
-- A dedicated prefill path would likely be one of the highest-impact next optimizations.
+- An experimental scalar megakernel prompt replay path (`QWEN3_TTS_PREFILL_KERNEL=1`) produced matching first prefill token but failed full utterance parity, so it remains off by default.
+- A correct exact prefill kernel or graph-captured PyTorch prefill would still be useful.
 
 ## 2. `decode_hidden_fp32_head` is not GPU-fused
 
@@ -119,23 +121,15 @@ Why it matters:
 - There is no speculative, multi-frame, or chunkwise decode strategy yet.
 - That limits how much TTFC and RTF can improve beyond single-step optimization.
 
-## 7. No true overlap pipeline between talker generation and audio decode
+## 7. Real overlap pipeline is wired in but does not currently help
 
-There is cadence control for when audio decode runs, but not a real producer/consumer multi-stream overlap design between talker generation and tokenizer/vocoder decode.
+A producer/consumer overlap path between talker generation and tokenizer/vocoder decode is wired into `services/tts_qwen3/megakernel_talker.py` behind `QWEN3_TTS_AUDIO_DECODE_OVERLAP=1`. It runs the incremental tokenizer decoder on a dedicated CUDA stream from a worker thread; output audio is bit-identical to the serial path.
 
-```python
-# services/tts_qwen3/megakernel_talker.py
-if adaptive_decode_cadence:
-    ...
-if should_decode:
-    ...
-```
+Empirically, on the RTX 5090 with `flash_attention_2`, the overlap path does not improve TTFC, RTF, or max chunk gap meaningfully. Subtalker execution at ~60 ms / frame dominates wall time; audio decode contributes only ~12 ms / frame averaged, capping overlap gains at roughly 5-6% of total wall. The overlap path also adds a one-frame TTFC penalty because the first chunk cannot be yielded until the next iteration's drain.
 
-Source: `services/tts_qwen3/megakernel_talker.py:838`, `services/tts_qwen3/megakernel_talker.py:848`
-
-Why it matters:
-- Cadence tuning helps, but it is not the same as overlapping independent work on separate streams.
-- A true overlap pipeline could improve steady-state RTF.
+Why it still matters:
+- The overlap implementation is now ready to be reused if subtalker cost drops materially (e.g., after CUDA graph capture or speculative decode).
+- The benchmark numbers in the README show the empirical ceiling and where new effort should go.
 
 ## 8. No true batched CUDA talker kernel yet
 
@@ -152,7 +146,7 @@ If optimizing for the next biggest wins, the likely order is:
 1. Subtalker/code predictor kernel specialization or graph capture
 2. Better overlap between talker generation and tokenizer/audio decode
 3. Speech tokenizer custom-kernel acceleration
-4. Megakernel or otherwise specialized talker prefill
+4. Exact megakernel or graph-captured talker prefill
 5. Fully fused fp32 LM-head/token selection path
 6. CUDA-graph or similar launch-overhead reduction for the TTS hot loop
 7. True batched CUDA talker decode with batch-aware KV/cache layout
