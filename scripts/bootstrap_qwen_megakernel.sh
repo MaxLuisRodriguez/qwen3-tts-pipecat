@@ -77,6 +77,13 @@ QWEN_MEGAKERNEL_MODEL_NAME=kernel/weights/Qwen3-0.6B
 # Build cache + parallelism.
 TORCH_EXTENSIONS_DIR=.torch_extensions
 MAX_JOBS=8
+TORCH_CUDA_ARCH_LIST=12.0
+
+# Optional performance dependency for Qwen3-TTS attention backend.
+INSTALL_FLASH_ATTN=1
+FLASH_ATTN_VERSION=2.8.3
+# Set to 1 to fail bootstrap if flash-attn install fails.
+REQUIRE_FLASH_ATTN=0
 
 # Compile-time decode tuning (defaults from this repo's build.py).
 LDG_NUM_BLOCKS=128
@@ -148,6 +155,14 @@ load_env() {
   QWEN_MEGAKERNEL_MODEL_NAME="$(resolve_model_source "${QWEN_MEGAKERNEL_MODEL_NAME:-kernel/weights/Qwen3-0.6B}")"
   export MAX_JOBS
   MAX_JOBS="${MAX_JOBS:-8}"
+  export TORCH_CUDA_ARCH_LIST
+  TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
+  export INSTALL_FLASH_ATTN
+  INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
+  export FLASH_ATTN_VERSION
+  FLASH_ATTN_VERSION="${FLASH_ATTN_VERSION:-2.8.3}"
+  export REQUIRE_FLASH_ATTN
+  REQUIRE_FLASH_ATTN="${REQUIRE_FLASH_ATTN:-0}"
 
   mkdir -p "${HF_HOME}" "${HF_HUB_CACHE}" "${TORCH_EXTENSIONS_DIR}"
 }
@@ -221,6 +236,41 @@ setup_python_env() {
   retry pip install -c "${RUNTIME_CONSTRAINTS}" -r "${REPO_ROOT}/services/llm_megakernel/requirements.txt" || fail "Failed to install llm service dependencies."
   retry pip install -c "${RUNTIME_CONSTRAINTS}" -r "${REPO_ROOT}/services/tts_qwen3/requirements.txt" || fail "Failed to install tts service dependencies."
   retry pip install -c "${RUNTIME_CONSTRAINTS}" -r "${REPO_ROOT}/pipecat_demo/requirements.txt" || fail "Failed to install pipecat dependencies."
+  install_flash_attn
+}
+
+install_flash_attn() {
+  if [[ "${INSTALL_FLASH_ATTN:-1}" != "1" ]]; then
+    log "Skipping flash-attn install because INSTALL_FLASH_ATTN=${INSTALL_FLASH_ATTN}."
+    return
+  fi
+
+  cd "${KERNEL_DIR}"
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+
+  if python - <<'PY' >/dev/null 2>&1
+import flash_attn
+PY
+  then
+    log "flash-attn already imports successfully."
+    return
+  fi
+
+  log "Installing flash-attn==${FLASH_ATTN_VERSION} for RTX 5090/cu128."
+  if retry env TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}" MAX_JOBS="${MAX_JOBS:-8}" \
+    pip install "flash-attn==${FLASH_ATTN_VERSION}" --no-build-isolation; then
+    python - <<'PY' || fail "flash-attn installed but import check failed."
+import flash_attn
+print(f"flash_attn={getattr(flash_attn, '__version__', 'unknown')}")
+PY
+    return
+  fi
+
+  if [[ "${REQUIRE_FLASH_ATTN:-0}" == "1" ]]; then
+    fail "Failed to install required flash-attn."
+  fi
+  log "flash-attn install failed; continuing because REQUIRE_FLASH_ATTN=0."
 }
 
 verify_torch_gpu() {

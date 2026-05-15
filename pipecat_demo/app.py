@@ -796,6 +796,7 @@ class LocalQwenTTSService(TTSService):
         print(
             "[metrics][stream] "
             f"mode={streaming_mode} "
+            f"scheduler={tts_metrics.get('scheduler_mode', 'unknown')} "
             f"frame_by_frame={'yes' if frame_by_frame else 'no'} "
             f"chunk_count={chunk_count} "
             f"decode_stride={tts_metrics.get('decode_stride', 'unknown')} "
@@ -843,6 +844,7 @@ class LocalQwenTTSService(TTSService):
             "streaming_mode": "unknown",
             "decode_stride": "unknown",
             "max_new_tokens_effective": "unknown",
+            "scheduler_mode": "unknown",
             "stop_reason": "unknown",
             "audio_quality_ok": False,
             "dropped_frames_suspected": False,
@@ -876,6 +878,7 @@ class LocalQwenTTSService(TTSService):
                 streaming_mode = "unknown"
                 decode_stride = "unknown"
                 max_new_tokens_effective = str(effective_max_new_tokens)
+                scheduler_mode = "unknown"
                 stop_reason = "unknown"
                 timed_out_mid_stream = False
                 read_chunk_bytes = int(
@@ -919,6 +922,7 @@ class LocalQwenTTSService(TTSService):
                             "X-Max-New-Tokens-Effective",
                             str(effective_max_new_tokens),
                         )
+                        scheduler_mode = response.headers.get("X-Scheduler-Mode", "unknown")
                         stop_reason = response.headers.get("X-Stop-Reason", "unknown")
 
                         async def counted_chunks():
@@ -1008,6 +1012,7 @@ class LocalQwenTTSService(TTSService):
                             "streaming_mode": streaming_mode,
                             "decode_stride": decode_stride,
                             "max_new_tokens_effective": max_new_tokens_effective,
+                            "scheduler_mode": scheduler_mode,
                             "stop_reason": stop_reason,
                             "audio_quality_ok": bool(audio_quality_ok),
                             "dropped_frames_suspected": bool(dropped_frames_suspected),

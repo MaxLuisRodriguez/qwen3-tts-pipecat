@@ -1,0 +1,139 @@
+{
+  "config": {
+    "tts_url": "http://127.0.0.1:8001",
+    "concurrency": 1,
+    "requests": 1,
+    "request_rate": 1.0,
+    "jitter_ms": 0.0,
+    "max_new_tokens": 64,
+    "read_chunk_bytes": 960,
+    "seed": 1337,
+    "anti_cheat_note": "Start the TTS service with QWEN3_TTS_ANTI_CHEAT=1 to disable prompt/projection caches."
+  },
+  "wall_s": 7.160483730956912,
+  "summary": {
+    "requests": 1,
+    "successful": 1,
+    "failed": 0,
+    "max_active_observed": 1,
+    "ttfc_ms": {
+      "p50": 4689.222256653011,
+      "p90": 4689.222256653011,
+      "p99": 4689.222256653011
+    },
+    "total_ms": {
+      "p50": 7159.485020674765,
+      "p90": 7159.485020674765,
+      "p99": 7159.485020674765
+    },
+    "rtf": {
+      "p50": 2.237339068960864,
+      "p90": 2.237339068960864,
+      "p99": 2.237339068960864
+    },
+    "max_chunk_gap_ms": {
+      "p50": 490.8998804166913,
+      "p90": 490.8998804166913,
+      "p99": 490.8998804166913
+    },
+    "gpu": {
+      "samples": 14,
+      "util_avg_pct": 8.428571428571429,
+      "util_max_pct": 23.0,
+      "memory_max_mib": 3277.0
+    }
+  },
+  "results": [
+    {
+      "request_id": 0,
+      "scheduled_delay_s": 0.0,
+      "text": "Sure, I can help with that.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 153600,
+      "audio_s": 3.2,
+      "total_ms": 7159.485020674765,
+      "ttfc_ms": 4689.222256653011,
+      "rtf": 2.237339068960864,
+      "chunk_count": 160,
+      "max_chunk_gap_ms": 490.8998804166913,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "kernel_path": "qwen_megakernel_C.decode_hidden_fp32_head",
+      "max_new_tokens_effective": "69",
+      "active_at_start": 1
+    }
+  ],
+  "gpu_samples": [
+    {
+      "t": 8022976.944391125,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 3.0
+    },
+    {
+      "t": 8022977.481250971,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 2237.0
+    },
+    {
+      "t": 8022978.017839267,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 2237.0
+    },
+    {
+      "t": 8022978.550889578,
+      "gpu_util_pct": 8.0,
+      "memory_used_mib": 2789.0
+    },
+    {
+      "t": 8022979.109148995,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 2789.0
+    },
+    {
+      "t": 8022979.646439399,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 2789.0
+    },
+    {
+      "t": 8022980.182038121,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 2789.0
+    },
+    {
+      "t": 8022980.717960732,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 2789.0
+    },
+    {
+      "t": 8022981.273002573,
+      "gpu_util_pct": 1.0,
+      "memory_used_mib": 3257.0
+    },
+    {
+      "t": 8022981.811287205,
+      "gpu_util_pct": 20.0,
+      "memory_used_mib": 3273.0
+    },
+    {
+      "t": 8022982.331324868,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 3277.0
+    },
+    {
+      "t": 8022982.889322769,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 3277.0
+    },
+    {
+      "t": 8022983.426584409,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 3277.0
+    },
+    {
+      "t": 8022983.981202566,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 3277.0
+    }
+  ]
+}

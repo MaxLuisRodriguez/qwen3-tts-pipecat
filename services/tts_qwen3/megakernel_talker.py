@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import struct
+import time
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -20,6 +21,17 @@ class StreamStats:
     audio_seconds: float = 0.0
     frames_generated: int = 0
     stop_reason: str = "unknown"
+    prefill_ms: float = 0.0
+    subtalker_ms: float = 0.0
+    talker_decode_ms: float = 0.0
+    audio_decode_ms: float = 0.0
+    subtalker_calls: int = 0
+    talker_decode_calls: int = 0
+    audio_decode_calls: int = 0
+    audio_chunks: int = 0
+    first_decode_ms: float | None = None
+    kernel_path: str = "qwen_megakernel_C.decode_hidden_fp32_head"
+    timing_mode: str = "wall_async"
 
 
 class IncrementalTokenizerDecoderV2:
@@ -179,6 +191,7 @@ class TalkerMegakernelBackend:
         self._max_seq_len = int(os.getenv("QWEN3_TTS_MAX_SEQ_LEN", "4096"))
         self._sample_rate = self._resolve_output_sample_rate()
         self._decode_upsample_rate = self._resolve_decode_upsample_rate()
+        self._assert_kernel_compatible()
         # Match upstream Qwen3-TTS CustomVoice generation defaults. This only
         # changes how text is conditioned into the talker; audio is still
         # streamed incrementally once decode begins.
@@ -196,6 +209,47 @@ class TalkerMegakernelBackend:
         self._cos_table, self._sin_table = self._build_rope_tables()
 
         self._alloc_runtime_buffers()
+
+    @staticmethod
+    def _anti_cheat_mode() -> bool:
+        return os.getenv("QWEN3_TTS_ANTI_CHEAT", "0") == "1"
+
+    def _assert_kernel_compatible(self) -> None:
+        """Fail early if the talker shape no longer matches the scalar kernel."""
+        expected = {
+            "num_hidden_layers": 28,
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+        }
+        actual = {
+            "num_hidden_layers": self._num_layers,
+            "hidden_size": self._hidden_size,
+            "intermediate_size": self._intermediate,
+            "num_attention_heads": int(self._talker.config.num_attention_heads),
+            "num_key_value_heads": self._num_kv_heads,
+            "head_dim": self._head_dim,
+        }
+        mismatches = {
+            key: (actual[key], expected[key])
+            for key in expected
+            if actual[key] != expected[key]
+        }
+        if mismatches:
+            detail = ", ".join(
+                f"{key}=actual:{actual_value}/expected:{expected_value}"
+                for key, (actual_value, expected_value) in mismatches.items()
+            )
+            raise ValueError(
+                "Qwen3-TTS talker config is incompatible with the current "
+                f"qwen_megakernel scalar decode constants: {detail}"
+            )
+        if self._device.type != "cuda":
+            raise ValueError("qwen_megakernel talker backend requires CUDA.")
+        if self._dtype != torch.bfloat16:
+            raise ValueError(f"qwen_megakernel talker backend requires bf16 weights, got {self._dtype}.")
 
     def _build_rope_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
         rotary = getattr(self._talker.model, "rotary_emb", None)
@@ -315,9 +369,10 @@ class TalkerMegakernelBackend:
         self, speaker: str, language: str, non_streaming_text_mode: bool
     ) -> dict[str, torch.Tensor]:
         key = (speaker.lower(), language.lower(), bool(non_streaming_text_mode))
-        cached = self._prompt_scaffold_cache.get(key)
-        if cached is not None:
-            return cached
+        if not self._anti_cheat_mode():
+            cached = self._prompt_scaffold_cache.get(key)
+            if cached is not None:
+                return cached
 
         processor = self._qwen.processor
         scaffold_text = "<|im_start|>assistant\nx<|im_end|>\n<|im_start|>assistant\n"
@@ -371,13 +426,15 @@ class TalkerMegakernelBackend:
             "tts_pad_embed": tts_pad_embed.contiguous(),
             "codec_embed_tail": codec_embed[:, -1:].contiguous(),
         }
-        self._prompt_scaffold_cache[key] = cached
+        if not self._anti_cheat_mode():
+            self._prompt_scaffold_cache[key] = cached
         return cached
 
     def _get_projected_text_hidden(self, text: str) -> torch.Tensor:
-        cached = self._projected_text_cache.get(text)
-        if cached is not None:
-            return cached
+        if not self._anti_cheat_mode():
+            cached = self._projected_text_cache.get(text)
+            if cached is not None:
+                return cached
 
         processor = self._qwen.processor
         wrapped = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
@@ -388,7 +445,7 @@ class TalkerMegakernelBackend:
             self._talker.get_text_embeddings()(input_ids[:, 3:-5])
         ).contiguous()
 
-        if self._projected_text_cache_limit > 0:
+        if self._projected_text_cache_limit > 0 and not self._anti_cheat_mode():
             if len(self._projected_text_cache) >= self._projected_text_cache_limit:
                 oldest_key = next(iter(self._projected_text_cache))
                 self._projected_text_cache.pop(oldest_key, None)
@@ -546,6 +603,118 @@ class TalkerMegakernelBackend:
         return torch.argmax(logits, dim=0, keepdim=True).to(torch.long)
 
     @staticmethod
+    def _sync_timing_enabled() -> bool:
+        return os.getenv("QWEN3_TTS_SYNC_TIMING", "0") == "1"
+
+    @staticmethod
+    def _phase_start(sync_timing: bool) -> float:
+        if sync_timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    @staticmethod
+    def _phase_ms(started_at: float, sync_timing: bool) -> float:
+        if sync_timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return (time.perf_counter() - started_at) * 1000.0
+
+    def debug_first_step_parity(
+        self,
+        text: str,
+        speaker: str,
+        *,
+        language: str = "auto",
+    ) -> dict[str, object]:
+        """Compare one talker continuation step against the PyTorch model path."""
+        with torch.inference_mode():
+            self._reset_runtime()
+            talker_input_embed, trailing_text_hidden, tts_pad_embed = self._build_custom_voice_prompt(
+                text,
+                speaker,
+                language=language,
+            )
+            prefill = self._talker.model(
+                inputs_embeds=talker_input_embed,
+                use_cache=True,
+                return_dict=True,
+            )
+            seq_len = int(talker_input_embed.shape[1])
+            next_first = torch.argmax(self._talker.codec_head(prefill.last_hidden_state[:, -1, :]), dim=-1).to(
+                torch.long
+            )
+            first_hidden = self._talker.get_input_embeddings()(next_first.unsqueeze(0))
+            past_hidden = prefill.last_hidden_state[:, -1:, :]
+            frame_codes, codec_sum = self._predict_subtalker_frame(
+                first_token=next_first,
+                first_hidden=first_hidden,
+                past_hidden=past_hidden,
+                do_sample=False,
+                top_p=1.0,
+                top_k=0,
+                temperature=0.0,
+            )
+            input_embed = codec_sum
+            if trailing_text_hidden.shape[1] > 0:
+                input_embed = input_embed + trailing_text_hidden[:, 0].unsqueeze(1)
+            else:
+                input_embed = input_embed + tts_pad_embed
+
+            baseline = self._talker.model(
+                inputs_embeds=input_embed,
+                past_key_values=prefill.past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            baseline_hidden = baseline.last_hidden_state[:, -1, :].detach().float()
+            baseline_logits = torch.mv(self._lm_head_weight_f32, baseline_hidden[0])
+            baseline_token = int(torch.argmax(baseline_logits).item())
+
+            self._copy_prefill_cache(prefill.past_key_values, seq_len)
+            self._decode_hidden_fp32_head(
+                self._out_token,
+                input_embed[0, 0].to(torch.bfloat16).contiguous(),
+                self._layer_weights_packed,
+                self._final_norm_weight,
+                self._lm_head_weight_f32,
+                self._cos_table,
+                self._sin_table,
+                self._k_cache,
+                self._v_cache,
+                self._hidden,
+                self._act,
+                self._res,
+                self._q,
+                self._k,
+                self._v,
+                self._attn_out,
+                self._mlp_inter,
+                self._norm_out,
+                self._num_layers,
+                seq_len,
+                self._max_seq_len,
+                self._attn_scale,
+            )
+            torch.cuda.synchronize()
+            custom_token = int(self._out_token.item())
+            custom_hidden = self._norm_out.detach().float().view(1, -1)
+            hidden_diff = (baseline_hidden - custom_hidden).abs()
+            custom_logits = torch.mv(self._lm_head_weight_f32, custom_hidden[0])
+            logit_diff = (baseline_logits - custom_logits).abs()
+
+        return {
+            "kernel_path": "qwen_megakernel_C.decode_hidden_fp32_head",
+            "first_prefill_token": int(next_first.view(-1)[0].item()),
+            "first_frame_codes": [int(v) for v in frame_codes.detach().cpu().tolist()],
+            "baseline_next_token": baseline_token,
+            "custom_next_token": custom_token,
+            "token_match": baseline_token == custom_token,
+            "hidden_max_abs_diff": float(hidden_diff.max().item()),
+            "hidden_mean_abs_diff": float(hidden_diff.mean().item()),
+            "logit_max_abs_diff": float(logit_diff.max().item()),
+            "logit_mean_abs_diff": float(logit_diff.mean().item()),
+        }
+
+    @staticmethod
     def _sample_subtalker_token(
         logits: torch.Tensor,
         *,
@@ -665,8 +834,8 @@ class TalkerMegakernelBackend:
             effective_decode_stride = max(1, int(decode_stride))
             first_chunk_frames = max(1, int(os.getenv("QWEN3_TTS_FIRST_CHUNK_FRAMES", "1")))
             adaptive_decode_cadence = os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1"
-            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "16")))
-            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "32")))
+            decode_stride_mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "4")))
+            decode_stride_late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "8")))
             decode_stride_late_start_frame = int(
                 os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24")
             )
@@ -696,6 +865,8 @@ class TalkerMegakernelBackend:
             top_k = int(os.getenv("QWEN3_TTS_SUBTALKER_TOP_K", "40"))
             temperature = float(os.getenv("QWEN3_TTS_SUBTALKER_TEMPERATURE", "0.8"))
             incremental_audio_decoder = self._make_incremental_audio_decoder()
+            sync_timing = self._sync_timing_enabled()
+            stats.timing_mode = "wall_sync" if sync_timing else "wall_async"
 
             with torch.inference_mode():
                 self._reset_runtime()
@@ -703,6 +874,7 @@ class TalkerMegakernelBackend:
                 ended = torch.cuda.Event(enable_timing=True)
                 started.record()
 
+                prefill_started = self._phase_start(sync_timing)
                 talker_input_embed, trailing_text_hidden, tts_pad_embed = self._build_custom_voice_prompt(
                     text,
                     speaker,
@@ -713,6 +885,7 @@ class TalkerMegakernelBackend:
                     use_cache=True,
                     return_dict=True,
                 )
+                stats.prefill_ms += self._phase_ms(prefill_started, sync_timing)
 
                 next_first = torch.argmax(self._talker.codec_head(prefill.last_hidden_state[:, -1, :]), dim=-1).to(
                     torch.long
@@ -759,6 +932,7 @@ class TalkerMegakernelBackend:
                     self._token_buf[0] = next_token
                     next_first = self._token_buf
                     first_hidden = self._talker.get_input_embeddings()(next_first.unsqueeze(0))
+                    subtalker_started = self._phase_start(sync_timing)
                     frame_codes, codec_sum = self._predict_subtalker_frame(
                         first_token=next_first,
                         first_hidden=first_hidden,
@@ -768,6 +942,8 @@ class TalkerMegakernelBackend:
                         top_k=top_k,
                         temperature=temperature,
                     )
+                    stats.subtalker_ms += self._phase_ms(subtalker_started, sync_timing)
+                    stats.subtalker_calls += 1
 
                     if prev_first_token is not None and next_token == prev_first_token:
                         repeated_first_token_run += 1
@@ -801,6 +977,7 @@ class TalkerMegakernelBackend:
                     else:
                         input_embed = input_embed + tts_pad_embed
 
+                    decode_started = self._phase_start(sync_timing)
                     self._decode_hidden_fp32_head(
                         self._out_token,
                         input_embed[0, 0].to(torch.bfloat16).contiguous(),
@@ -825,6 +1002,12 @@ class TalkerMegakernelBackend:
                         self._max_seq_len,
                         self._attn_scale,
                     )
+                    stats.talker_decode_ms += self._phase_ms(decode_started, sync_timing)
+                    stats.talker_decode_calls += 1
+                    if stats.first_decode_ms is None:
+                        ended.record()
+                        torch.cuda.synchronize()
+                        stats.first_decode_ms = float(started.elapsed_time(ended))
 
                     self._token_buf.copy_(self._out_token)
                     next_first = self._token_buf
@@ -846,6 +1029,7 @@ class TalkerMegakernelBackend:
                         should_decode = True
 
                     if should_decode:
+                        audio_decode_started = self._phase_start(sync_timing)
                         if incremental_audio_decoder is not None:
                             new_frame_count = frame_count - decoded_frames
                             if new_frame_count > 0:
@@ -866,9 +1050,12 @@ class TalkerMegakernelBackend:
                                 decoded_frames=decoded_frames,
                                 left_context_frames=incremental_left_context_frames,
                             )
+                        stats.audio_decode_ms += self._phase_ms(audio_decode_started, sync_timing)
+                        stats.audio_decode_calls += 1
                         if delta.size > 0:
                             emitted_samples += delta.shape[0]
                             stats.frames_generated = frame_count
+                            stats.audio_chunks += 1
                             if stats.ttfc_ms is None:
                                 ended.record()
                                 torch.cuda.synchronize()
@@ -893,6 +1080,7 @@ class TalkerMegakernelBackend:
                                     break
 
                 if frame_count > 0:
+                    audio_decode_started = self._phase_start(sync_timing)
                     if incremental_audio_decoder is not None:
                         new_frame_count = frame_count - decoded_frames
                         if new_frame_count > 0:
@@ -913,9 +1101,12 @@ class TalkerMegakernelBackend:
                             decoded_frames=decoded_frames,
                             left_context_frames=incremental_left_context_frames,
                         )
+                    stats.audio_decode_ms += self._phase_ms(audio_decode_started, sync_timing)
+                    stats.audio_decode_calls += 1
                     stats.frames_generated = frame_count
                     if delta.size > 0:
                         emitted_samples += delta.shape[0]
+                        stats.audio_chunks += 1
                         if stats.ttfc_ms is None:
                             ended.record()
                             torch.cuda.synchronize()

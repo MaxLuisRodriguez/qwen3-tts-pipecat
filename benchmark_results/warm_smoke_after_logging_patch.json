@@ -1,0 +1,94 @@
+{
+  "config": {
+    "tts_url": "http://127.0.0.1:8001",
+    "concurrency": 1,
+    "requests": 1,
+    "request_rate": 1.0,
+    "jitter_ms": 0.0,
+    "max_new_tokens": 64,
+    "read_chunk_bytes": 960,
+    "seed": 1337,
+    "anti_cheat_note": "Start the TTS service with QWEN3_TTS_ANTI_CHEAT=1 to disable prompt/projection caches."
+  },
+  "wall_s": 2.454631888307631,
+  "summary": {
+    "requests": 1,
+    "successful": 1,
+    "failed": 0,
+    "max_active_observed": 1,
+    "ttfc_ms": {
+      "p50": 109.55550149083138,
+      "p90": 109.55550149083138,
+      "p99": 109.55550149083138
+    },
+    "total_ms": {
+      "p50": 2453.809146769345,
+      "p90": 2453.809146769345,
+      "p99": 2453.809146769345
+    },
+    "rtf": {
+      "p50": 0.7668153583654203,
+      "p90": 0.7668153583654203,
+      "p99": 0.7668153583654203
+    },
+    "max_chunk_gap_ms": {
+      "p50": 468.2144494727254,
+      "p90": 468.2144494727254,
+      "p99": 468.2144494727254
+    },
+    "gpu": {
+      "samples": 5,
+      "util_avg_pct": 18.0,
+      "util_max_pct": 23.0,
+      "memory_max_mib": 3277.0
+    }
+  },
+  "results": [
+    {
+      "request_id": 0,
+      "scheduled_delay_s": 0.0,
+      "text": "Sure, I can help with that.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 153600,
+      "audio_s": 3.2,
+      "total_ms": 2453.809146769345,
+      "ttfc_ms": 109.55550149083138,
+      "rtf": 0.7668153583654203,
+      "chunk_count": 160,
+      "max_chunk_gap_ms": 468.2144494727254,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "kernel_path": "qwen_megakernel_C.decode_hidden_fp32_head",
+      "max_new_tokens_effective": "69",
+      "active_at_start": 1
+    }
+  ],
+  "gpu_samples": [
+    {
+      "t": 8022997.357009038,
+      "gpu_util_pct": 0.0,
+      "memory_used_mib": 3277.0
+    },
+    {
+      "t": 8022997.894319929,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 3277.0
+    },
+    {
+      "t": 8022998.414380762,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 3277.0
+    },
+    {
+      "t": 8022998.970053991,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 3277.0
+    },
+    {
+      "t": 8022999.509582332,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 3277.0
+    }
+  ]
+}

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from collections.abc import Iterator
 
 import numpy as np
@@ -29,22 +33,41 @@ from megakernel_talker import TalkerMegakernelBackend
 
 app = FastAPI(title="Qwen3 TTS Service")
 LOGGER = logging.getLogger(__name__)
+_LOG_LEVEL = os.getenv("QWEN3_TTS_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+LOGGER.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
 
 SAMPLE_RATE = int(os.getenv("QWEN3_TTS_SAMPLE_RATE", "24000"))
 CHUNK_SIZE = int(os.getenv("QWEN3_TTS_CHUNK_SIZE", "480"))
 SAMPLE_WIDTH = 2
 BYTES_PER_CHUNK = CHUNK_SIZE * SAMPLE_WIDTH
 DECODE_STRIDE = int(os.getenv("QWEN3_TTS_DECODE_STRIDE", "1"))
+_QUEUE_SENTINEL = object()
 
 
 def _decode_stride_header_value() -> str:
     if os.getenv("QWEN3_TTS_ADAPTIVE_DECODE_CADENCE", "1") == "1":
-        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "16")))
-        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "32")))
+        mid = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_MID", "4")))
+        late = max(1, int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE", "8")))
         late_start = int(os.getenv("QWEN3_TTS_DECODE_STRIDE_LATE_START_FRAME", "24"))
         left_context = max(0, int(os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "12")))
         return f"adaptive(mid={mid},late={late}@{late_start},ctx={left_context})"
     return str(DECODE_STRIDE)
+
+
+def _default_attn_implementation() -> str:
+    configured = os.getenv("QWEN3_TTS_ATTN_IMPL")
+    if configured:
+        return configured
+    try:
+        import flash_attn  # noqa: F401
+
+        return "flash_attention_2"
+    except Exception:
+        return "sdpa"
 
 
 class TTSRequest(BaseModel):
@@ -59,6 +82,247 @@ class TTSRequest(BaseModel):
     )
 
 
+@dataclass
+class ScheduledTTSRequest:
+    """A queued TTS request with its own streaming output queue."""
+
+    request_id: str
+    text: str
+    speaker: str
+    language: str
+    max_new_tokens: int
+    stats: object
+    output_queue: "queue.Queue[object]"
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    submitted_at: float = field(default_factory=time.perf_counter)
+    admitted_at: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    first_audio_at: float | None = None
+    error: BaseException | None = None
+    batch_admit_size: int = 1
+
+
+class ScheduledAudioIterator:
+    """Blocking iterator over a scheduled request's audio chunks."""
+
+    def __init__(self, state: ScheduledTTSRequest):
+        self._state = state
+        self._closed = False
+
+    def __iter__(self) -> "ScheduledAudioIterator":
+        return self
+
+    def __next__(self) -> np.ndarray:
+        if self._closed:
+            raise StopIteration
+        item = self._state.output_queue.get()
+        if item is _QUEUE_SENTINEL:
+            self._closed = True
+            raise StopIteration
+        if isinstance(item, BaseException):
+            self._closed = True
+            raise item
+        return item
+
+    def close(self) -> None:
+        self._closed = True
+        self._state.cancelled.set()
+
+
+class TTSRequestScheduler:
+    """
+    Scheduler-level batch admission for Qwen3-TTS requests.
+
+    This intentionally does not claim true CUDA kernel batching. Each admitted
+    request runs on an independent scalar backend slot until the CUDA path is
+    made batch-aware.
+    """
+
+    def __init__(self, engine: "Qwen3TTSEngine"):
+        self._engine = engine
+        self._max_active = max(1, int(os.getenv("QWEN3_TTS_MAX_ACTIVE_REQUESTS", "4")))
+        self._batch_window_s = max(
+            0.0, float(os.getenv("QWEN3_TTS_BATCH_WINDOW_MS", "6.0")) / 1000.0
+        )
+        self._max_prefill_wait_s = max(
+            0.0, float(os.getenv("QWEN3_TTS_MAX_PREFILL_WAIT_MS", "100.0")) / 1000.0
+        )
+        self._queue_maxsize = max(1, int(os.getenv("QWEN3_TTS_AUDIO_QUEUE_MAX_CHUNKS", "16")))
+        self._pending: "queue.Queue[ScheduledTTSRequest]" = queue.Queue()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._max_active,
+            thread_name_prefix="qwen3-tts-slot",
+        )
+        self._lock = threading.Lock()
+        self._active = 0
+        self._shutdown = threading.Event()
+        self._dispatcher = threading.Thread(
+            target=self._dispatch_loop,
+            name="qwen3-tts-scheduler",
+            daemon=True,
+        )
+        self._dispatcher.start()
+
+    @property
+    def mode(self) -> str:
+        return "scheduler_scalar"
+
+    @property
+    def max_active(self) -> int:
+        return self._max_active
+
+    def submit(
+        self,
+        *,
+        text: str,
+        speaker: str,
+        language: str,
+        max_new_tokens: int,
+    ) -> tuple[object, Iterator[np.ndarray]]:
+        from megakernel_talker import StreamStats
+
+        state = ScheduledTTSRequest(
+            request_id=uuid.uuid4().hex,
+            text=text,
+            speaker=speaker,
+            language=language,
+            max_new_tokens=max_new_tokens,
+            stats=StreamStats(),
+            output_queue=queue.Queue(maxsize=self._queue_maxsize),
+        )
+        self._pending.put(state)
+        return state.stats, ScheduledAudioIterator(state)
+
+    def _available_slots(self) -> int:
+        with self._lock:
+            return max(0, self._max_active - self._active)
+
+    def _mark_active(self, count: int) -> None:
+        with self._lock:
+            self._active += count
+
+    def _mark_finished(self) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+
+    def _dispatch_loop(self) -> None:
+        while not self._shutdown.is_set():
+            try:
+                first = self._pending.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            batch = [first]
+            deadline = min(
+                first.submitted_at + self._max_prefill_wait_s,
+                time.perf_counter() + self._batch_window_s,
+            )
+            while len(batch) < self._max_active:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    break
+                try:
+                    batch.append(self._pending.get(timeout=remaining))
+                except queue.Empty:
+                    break
+
+            for state in batch:
+                while not self._shutdown.is_set() and self._available_slots() <= 0:
+                    time.sleep(0.002)
+                state.admitted_at = time.perf_counter()
+                state.batch_admit_size = len(batch)
+                self._mark_active(1)
+                self._executor.submit(self._run_state, state)
+
+    def _put_or_cancel(self, state: ScheduledTTSRequest, item: object) -> bool:
+        while not state.cancelled.is_set():
+            try:
+                state.output_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run_state(self, state: ScheduledTTSRequest) -> None:
+        backend = None
+        raw_iter: Iterator[np.ndarray] | None = None
+        try:
+            state.started_at = time.perf_counter()
+            backend = self._engine.checkout_backend()
+            raw_stats, raw_iter = backend.stream_audio(
+                text=state.text,
+                speaker=state.speaker,
+                language=state.language,
+                max_new_tokens=state.max_new_tokens,
+                decode_stride=DECODE_STRIDE,
+            )
+            for audio in raw_iter:
+                if state.cancelled.is_set():
+                    break
+                if audio.size > 0 and state.first_audio_at is None:
+                    state.first_audio_at = time.perf_counter()
+                    raw_stats.ttfc_ms = (state.first_audio_at - state.submitted_at) * 1000.0
+                    setattr(state.stats, "ttfc_ms", raw_stats.ttfc_ms)
+                    setattr(state.stats, "scheduler_mode", self.mode)
+                    setattr(state.stats, "batch_admit_size", state.batch_admit_size)
+                if not self._put_or_cancel(state, audio):
+                    break
+            for attr in (
+                "ttfc_ms",
+                "generation_s",
+                "audio_seconds",
+                "frames_generated",
+                "stop_reason",
+                "prefill_ms",
+                "subtalker_ms",
+                "talker_decode_ms",
+                "audio_decode_ms",
+                "subtalker_calls",
+                "talker_decode_calls",
+                "audio_decode_calls",
+                "audio_chunks",
+                "first_decode_ms",
+                "kernel_path",
+                "timing_mode",
+            ):
+                if hasattr(raw_stats, attr):
+                    setattr(state.stats, attr, getattr(raw_stats, attr))
+            setattr(state.stats, "scheduler_mode", self.mode)
+            setattr(state.stats, "batch_admit_size", state.batch_admit_size)
+            setattr(state.stats, "queue_wait_ms", ((state.started_at or state.submitted_at) - state.submitted_at) * 1000.0)
+            LOGGER.info(
+                "TTS request completed id=%s mode=%s batch_admit=%s ttfc_ms=%s "
+                "generation_s=%.3f audio_s=%.3f frames=%s chunks=%s "
+                "prefill_ms=%.2f subtalker_ms=%.2f talker_decode_ms=%.2f audio_decode_ms=%.2f",
+                state.request_id,
+                self.mode,
+                state.batch_admit_size,
+                getattr(state.stats, "ttfc_ms", None),
+                float(getattr(state.stats, "generation_s", 0.0) or 0.0),
+                float(getattr(state.stats, "audio_seconds", 0.0) or 0.0),
+                getattr(state.stats, "frames_generated", None),
+                getattr(state.stats, "audio_chunks", None),
+                float(getattr(state.stats, "prefill_ms", 0.0) or 0.0),
+                float(getattr(state.stats, "subtalker_ms", 0.0) or 0.0),
+                float(getattr(state.stats, "talker_decode_ms", 0.0) or 0.0),
+                float(getattr(state.stats, "audio_decode_ms", 0.0) or 0.0),
+            )
+        except BaseException as exc:
+            state.error = exc
+            self._put_or_cancel(state, exc)
+        finally:
+            state.finished_at = time.perf_counter()
+            if raw_iter is not None:
+                close = getattr(raw_iter, "close", None)
+                if callable(close):
+                    close()
+            if backend is not None:
+                self._engine.return_backend(backend)
+            self._put_or_cancel(state, _QUEUE_SENTINEL)
+            self._mark_finished()
+
+
 class Qwen3TTSEngine:
     """Lazy-loaded Qwen3-TTS + talker megakernel backend."""
 
@@ -68,10 +332,13 @@ class Qwen3TTSEngine:
         )
         self.default_voice = os.getenv("QWEN3_TTS_DEFAULT_VOICE", "vivian")
         self.default_language = os.getenv("QWEN3_TTS_LANGUAGE", "english").strip().lower()
-        self.attn_implementation = os.getenv("QWEN3_TTS_ATTN_IMPL", "sdpa")
+        self.attn_implementation = _default_attn_implementation()
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._dtype = torch.bfloat16 if self._device.type == "cuda" else torch.float32
         self._load_lock = threading.Lock()
+        self._backend_lock = threading.Lock()
+        self._backend_pool: "queue.LifoQueue[TalkerMegakernelBackend]" = queue.LifoQueue()
+        self._backend_count = 0
         self._generate_lock = threading.Lock()
         self._generate_lock_timeout_s = float(
             os.getenv("QWEN3_TTS_GENERATE_LOCK_TIMEOUT_S", "180")
@@ -83,10 +350,11 @@ class Qwen3TTSEngine:
         ) == "1"
         self._model = None
         self._backend: TalkerMegakernelBackend | None = None
+        self._scheduler = TTSRequestScheduler(self)
 
     @property
     def loaded(self) -> bool:
-        return self._model is not None and self._backend is not None
+        return self._model is not None and self._backend_count > 0
 
     def load(self):
         if self.loaded:
@@ -104,47 +372,47 @@ class Qwen3TTSEngine:
             if self._device.type != "cuda":
                 self._model.model.to(self._device)
             self._backend = TalkerMegakernelBackend(self._model)
+            self._backend_pool.put(self._backend)
+            self._backend_count = 1
+
+    def checkout_backend(self) -> TalkerMegakernelBackend:
+        self.load()
+        if self._model is None:
+            raise RuntimeError("Qwen3-TTS model is not loaded.")
+        if self._rebuild_backend_per_request:
+            return TalkerMegakernelBackend(self._model)
+        try:
+            return self._backend_pool.get_nowait()
+        except queue.Empty:
+            pass
+        with self._backend_lock:
+            if self._backend_count < self._scheduler.max_active:
+                self._backend_count += 1
+                try:
+                    return TalkerMegakernelBackend(self._model)
+                except Exception:
+                    self._backend_count -= 1
+                    raise
+        return self._backend_pool.get()
+
+    def return_backend(self, backend: TalkerMegakernelBackend) -> None:
+        if self._rebuild_backend_per_request:
+            return
+        self._backend_pool.put(backend)
 
     def stream_synthesize(
         self, text: str, voice: str | None, max_new_tokens: int
     ) -> tuple[object, Iterator[np.ndarray], int]:
         self.load()
-        if self._backend is None:
-            raise RuntimeError("Megakernel talker backend failed to initialize.")
-        if self._rebuild_backend_per_request:
-            # Keep model weights resident; just rebuild decoding runtime state.
-            self._backend = TalkerMegakernelBackend(self._model)
         speaker = (voice or self.default_voice).strip() or self.default_voice
         effective_max_new_tokens = _estimate_max_new_tokens(text, max_new_tokens)
-        acquired = self._generate_lock.acquire(timeout=self._generate_lock_timeout_s)
-        if not acquired:
-            # Queue rather than hard-failing under overlap.
-            LOGGER.warning(
-                "TTS generation lock wait exceeded %.1fs; waiting for release.",
-                self._generate_lock_timeout_s,
-            )
-            self._generate_lock.acquire()
-        try:
-            stats, raw_iter = self._backend.stream_audio(
-                text=text,
-                speaker=speaker,
-                language=self.default_language,
-                max_new_tokens=effective_max_new_tokens,
-                decode_stride=DECODE_STRIDE,
-            )
-        except Exception:
-            self._generate_lock.release()
-            raise
-
-        def guarded_iter() -> Iterator[np.ndarray]:
-            try:
-                with torch.no_grad():
-                    for audio in raw_iter:
-                        yield audio
-            finally:
-                self._generate_lock.release()
-
-        return stats, guarded_iter(), effective_max_new_tokens
+        stats, audio_iter = self._scheduler.submit(
+            text=text,
+            speaker=speaker,
+            language=self.default_language,
+            max_new_tokens=effective_max_new_tokens,
+        )
+        return stats, audio_iter, effective_max_new_tokens
 
     def synthesize_fallback(
         self, text: str, voice: str | None, max_new_tokens: int
@@ -592,19 +860,21 @@ async def synthesize_stream_binary(request: TTSRequest):
             detail=last_error or "Model returned no usable audio from decode-time stream.",
         )
 
-    ttfc_ms = stats.ttfc_ms
-    if ttfc_ms is None:
-        ttfc_ms = (time.perf_counter() - request_started) * 1000.0
-
     headers = {
         "Content-Type": "audio/pcm; rate=24000; channels=1; width=16",
         "Cache-Control": "no-cache",
-        "X-TTFC-Ms": f"{ttfc_ms:.2f}",
+        # TTFC for a streaming response is only known after the first body
+        # chunk is emitted, so the client/benchmark must observe it directly.
+        "X-TTFC-Ms": "na",
+        "X-TTFC-Source": "client_observed_first_pcm_chunk",
         "X-RTF": "na",
         "X-Streaming-Mode": "decode_time_codec_stream",
+        "X-Scheduler-Mode": engine._scheduler.mode,
+        "X-Kernel-Path": "qwen_megakernel_C.decode_hidden_fp32_head",
+        "X-Max-Active-Requests": str(engine._scheduler.max_active),
         "X-Max-New-Tokens-Effective": str(effective_max_new_tokens),
         "X-Decode-Stride": _decode_stride_header_value(),
-        "X-Stop-Reason": getattr(stats, "stop_reason", "unknown"),
+        "X-Stop-Reason": "streaming",
         "X-Text-Stabilized": "1" if text_stabilized else "0",
     }
     if text_stabilized:
@@ -632,6 +902,9 @@ async def health():
         "model_loaded": engine.loaded,
         "model_name": engine.model_name,
         "device": str(engine._device),
+        "attn_implementation": engine.attn_implementation,
+        "scheduler_mode": engine._scheduler.mode,
+        "max_active_requests": engine._scheduler.max_active,
     }
 
 
@@ -644,7 +917,12 @@ async def spec():
         "bytes_per_chunk": BYTES_PER_CHUNK,
         "format": "16-bit PCM, mono",
         "status": "talker megakernel + incremental codec decode",
+        "scheduler_mode": engine._scheduler.mode,
+        "max_active_requests": engine._scheduler.max_active,
+        "kernel_path": "qwen_megakernel_C.decode_hidden_fp32_head",
+        "batching_note": "scheduler-level scalar backend slots; CUDA talker decode is not yet a true batched kernel",
         "default_voice": engine.default_voice,
+        "attn_implementation": engine.attn_implementation,
         "decode_stride": _decode_stride_header_value(),
         "incremental_left_context_frames": int(
             os.getenv("QWEN3_TTS_INCREMENTAL_LEFT_CONTEXT_FRAMES", "25")

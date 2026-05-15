@@ -4,7 +4,7 @@ This repo adapts AlpinDale's `qwen_megakernel` decode kernel to run the Qwen3-TT
 
 `Deepgram STT -> Megakernel LLM service -> Local Qwen3-TTS talker service -> Daily audio output`
 
-The take-home prompt that guided this work is preserved in [project_instructions.md](/root/qwen3-tts-pipecat/project_instructions.md).
+The original take-home prompt is no longer stored in the repo; this README is the current source of run, benchmark, and limitation notes.
 
 ## What Is Working
 
@@ -13,10 +13,12 @@ The take-home prompt that guided this work is preserved in [project_instructions
 - Daily Pipecat room bot with streamed PCM audio
 - Decode-time audio streaming to Pipecat without full-utterance buffering
 - Binary TTS path now pushes chunks to Pipecat immediately as they are decoded
+- Scheduler-level multi-request TTS serving with up to 4 scalar backend slots
 - End-to-end voice turns with live terminal metrics
 
 The pipeline is now stable for short voice interactions. 
 The primary remaining limitation is performance: TTFC and RTF remain above the stretch targets.
+The batch-4 path is currently scheduler-level concurrency, not a true batched CUDA megakernel.
 
 ## Key Integration Decisions
 
@@ -68,6 +70,7 @@ No external TTS fallback was introduced; all results reflect the performance of 
 - [scripts/bootstrap_qwen_megakernel.sh](/root/qwen3-tts-pipecat/scripts/bootstrap_qwen_megakernel.sh): bootstrap/runtime setup
 - [scripts/run_local.sh](/root/qwen3-tts-pipecat/scripts/run_local.sh): one-command local demo
 - [scripts/benchmark_stack.py](/root/qwen3-tts-pipecat/scripts/benchmark_stack.py): service-level benchmark
+- [scripts/benchmark_concurrent_tts.py](/root/qwen3-tts-pipecat/scripts/benchmark_concurrent_tts.py): jittered concurrent TTS benchmark
 - [scripts/benchmark_roundtrip.py](/root/qwen3-tts-pipecat/scripts/benchmark_roundtrip.py): parses Pipecat turn metrics
 
 ## Setup
@@ -80,6 +83,7 @@ bash scripts/bootstrap_qwen_megakernel.sh
 ```
 
 Bootstrap creates `kernel/.venv`, seeds `pip`, installs the validated runtime, resolves model weights, and builds the megakernel extension.
+It also attempts to install `flash-attn==2.8.3` with `TORCH_CUDA_ARCH_LIST=12.0` for RTX 5090/Blackwell. Set `REQUIRE_FLASH_ATTN=1` before running bootstrap if you want setup to fail loudly when Flash Attention cannot be built.
 
 ### 2. Runtime config
 
@@ -122,8 +126,43 @@ kernel/.venv/bin/python scripts/benchmark_stack.py \
 
 ```bash
 kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
-  --log-file /path/to/run_local.log \
-  --timeout-s 120
+  --log-path /path/to/run_local.log \
+  --wait-timeout-s 120
+```
+
+### Jittered concurrent TTS check
+
+Start the TTS service with anti-cheat cache disabling if you want a clean benchmark:
+
+```bash
+QWEN3_TTS_ANTI_CHEAT=1 QWEN3_TTS_SYNC_TIMING=0 START_TTS_SERVICE=1 bash scripts/run_local.sh
+```
+
+Then run:
+
+```bash
+kernel/.venv/bin/python scripts/benchmark_concurrent_tts.py \
+  --tts-url http://127.0.0.1:8001 \
+  --concurrency 4 \
+  --requests 16 \
+  --request-rate 4 \
+  --jitter-ms 250 \
+  --json-out benchmark_batch4.json \
+  --csv-out benchmark_batch4.csv
+```
+
+This benchmark measures observed client-side time to first PCM chunk. It does not use generated headers for TTFC.
+The JSON/CSV outputs include backend headers such as `scheduler_mode`, `kernel_path`, and the effective max-token cap.
+
+### Deterministic parity/sanity check
+
+```bash
+kernel/.venv/bin/python scripts/check_tts_parity.py \
+  --text "the city is tehran" \
+  --voice vivian \
+  --language english \
+  --max-new-tokens 96 \
+  --json
 ```
 
 ### Exact backend measurement command used for the README numbers
@@ -202,34 +241,66 @@ START_TTS_SERVICE=1 bash scripts/run_local.sh
 
 ```bash
 kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
-  --log-file /path/to/run_local.log \
-  --timeout-s 120
+  --log-path /path/to/run_local.log \
+  --wait-timeout-s 120
 ```
 
 ## Current Measurements
 
-These are the current representative numbers for the code on `main`. They are intentionally reported as measured, not idealized:
+These are the current representative numbers from the remote RTX 5090 VM on 2026-05-15. They are intentionally reported as measured, not idealized.
 
-- Megakernel text decode smoke benchmark on the RTX 5090:
-  - about `1043 tok/s`
-- Representative warm local talker/TTS backend run:
-  - text: `the city is tehran`
-  - `ttfc_ms ~= 114.6`
-  - `generation_s ~= 4.686`
-  - `audio_s ~= 5.120`
-  - `rtf ~= 0.915`
-- Representative cold short-utterance run:
-  - text: `ready`
-  - `ttfc_ms ~= 731.0`
-  - `generation_s ~= 2.153`
-  - `audio_s ~= 1.520`
-  - `rtf ~= 1.416`
-- Last captured live Pipecat round-trip turn:
-  - `overall_ms ~= 5193.4`
-  - `llm_tok_s ~= 296.7`
-  - `ttfc_ms ~= 171.5`
-  - `rtf ~= 0.970`
-  - `audio_s ~= 4.560`
+Runtime:
+
+- `torch==2.7.0+cu128`
+- `flash-attn==2.8.3`
+- TTS attention implementation: `flash_attention_2`
+- benchmark env: `QWEN3_TTS_ANTI_CHEAT=1`, `QWEN3_TTS_SYNC_TIMING=0`
+- decode cadence: `adaptive(mid=4,late=8@24,ctx=25)`
+- scheduler mode: `scheduler_scalar`
+- kernel path reported by service: `qwen_megakernel_C.decode_hidden_fp32_head`
+
+Parity/sanity check:
+
+- command: `kernel/.venv/bin/python scripts/check_tts_parity.py --text ready --voice vivian --language english --max-new-tokens 64 --json`
+- result: `ok=true`
+- first-step PyTorch token: `215`
+- first-step custom-kernel token: `215`
+- hidden max/mean abs diff: `0.4534 / 0.0432`
+- logit max/mean abs diff: `0.1520 / 0.0320`
+- optimized/base audio duration delta: `0.32 s`
+- optimized/base RMS relative delta: `0.0021`
+- optimized/base peak relative delta: `0.3006`
+
+Phase timing from the same short parity run with `QWEN3_TTS_SYNC_TIMING=1`:
+
+- prefill: `220.7 ms`
+- subtalker/code predictor: `1259.6 ms`
+- talker custom-kernel decode: `33.5 ms`
+- speech tokenizer/audio decode: `281.9 ms`
+- frames generated: `22`
+- emitted audio: `1.76 s`
+
+Jittered concurrent TTS benchmark artifacts:
+
+- [benchmark_results/concurrency_1_after_instrumentation.json](/root/qwen3-tts-pipecat/benchmark_results/concurrency_1_after_instrumentation.json)
+- [benchmark_results/concurrency_2_after_instrumentation.json](/root/qwen3-tts-pipecat/benchmark_results/concurrency_2_after_instrumentation.json)
+- [benchmark_results/concurrency_4_after_instrumentation.json](/root/qwen3-tts-pipecat/benchmark_results/concurrency_4_after_instrumentation.json)
+- [benchmark_results/concurrency_8_after_instrumentation.json](/root/qwen3-tts-pipecat/benchmark_results/concurrency_8_after_instrumentation.json)
+
+| concurrency | successful | max active observed | TTFC p90 / p99 ms | RTF p50 / p99 | max chunk gap p99 ms | GPU avg / max util |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8/8 | 1 | `119.5 / 126.9` | `0.786 / 0.792` | `488.9` | `17.2% / 23.0%` |
+| 2 | 8/8 | 2 | `208.2 / 227.7` | `1.426 / 1.515` | `961.5` | `20.4% / 25.0%` |
+| 4 | 8/8 | 4 | `494.7 / 514.1` | `3.246 / 3.954` | `2527.3` | `18.4% / 24.0%` |
+| 8 | 8/8 | 8 client streams | `12792.1 / 14616.0` | `3.988 / 7.320` | `2547.6` | `17.7% / 24.0%` |
+
+Interpretation:
+
+- Single-stream TTFC is now good, but single-stream RTF still misses the `<= 0.5` target.
+- Concurrency 4 reaches four active scalar backend slots and p90 TTFC is just under `500 ms`, but p99 TTFC and RTF miss the target.
+- Concurrency 8 is not a true eight-slot server run. The server defaults to `QWEN3_TTS_MAX_ACTIVE_REQUESTS=4`, so the benchmark's eight client streams include queue wait.
+- Low GPU utilization plus the phase timings point to Python/PyTorch subtalker and audio decode work as the current top bottlenecks, not the custom talker decode kernel.
+- This is not a completed true batch-4 CUDA submission yet. It is an honest scheduler-level concurrency implementation with measurement, parity checks, and a clear bottleneck report.
 
 ## How TTFC And RTF Were Calculated
 
@@ -258,7 +329,8 @@ rtf = generation_s / audio_s
 The live round-trip numbers come from [pipecat_demo/app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py).
 
 - `ttfc_ms`
-  - taken from the TTS response header when present, otherwise from observed first chunk arrival
+  - measured from request start to the first received PCM body chunk
+  - `/synthesize_binary` intentionally reports `X-TTFC-Ms: na` because the server cannot know TTFC before response headers are sent
   - see [app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py#L915) and [app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py#L987)
 - `audio_s`
   - calculated from streamed PCM bytes:
@@ -279,18 +351,20 @@ rtf = tts_stream_s / audio_s
 Interpretation:
 
 - The local LLM decode path is no longer the dominant bottleneck.  
-- Warm-state TTS performance has improved significantly compared to earlier versions.
+- Warm-state TTS TTFC has improved significantly compared to earlier versions.
 - Cold start is still much slower than warm steady-state.
-- TTFC and RTF are improved enough for a smooth demo, but they still miss the take-home stretch targets.
+- RTF and chunk gaps still miss the take-home stretch targets under concurrent load.
 
 ## Why The Targets Are Still Missed
 
 The repo now has a stable and honest local stack, but the remaining bottlenecks are real:
 
-1. Talker prefill is still expensive.
+1. Subtalker/code predictor execution is the largest measured short-turn cost.
 2. Speech tokenizer decode, even incrementally, is still a major steady-state cost.
-3. Some short-turn reliability logic still trades latency for robustness.
-4. Long-form talker generation is much less efficient than the raw Qwen3 megakernel text decode path.
+3. Talker prefill is still a meaningful TTFC cost.
+4. The current multi-request path uses scheduler-level scalar backend slots; true batched CUDA decode is still future work.
+5. Some short-turn reliability logic still trades latency for robustness.
+6. Long-form talker generation is much less efficient than the raw Qwen3 megakernel text decode path.
 
 This explains why the system feels smooth during short interactions while still missing the take-home RTF target under formal measurement.
 

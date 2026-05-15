@@ -1,0 +1,344 @@
+{
+  "config": {
+    "tts_url": "http://127.0.0.1:8001",
+    "concurrency": 8,
+    "requests": 8,
+    "request_rate": 4.0,
+    "jitter_ms": 250.0,
+    "max_new_tokens": 64,
+    "read_chunk_bytes": 960,
+    "seed": 1337,
+    "anti_cheat_note": "Start the TTS service with QWEN3_TTS_ANTI_CHEAT=1 to disable prompt/projection caches."
+  },
+  "wall_s": 16.42941813636571,
+  "summary": {
+    "requests": 8,
+    "successful": 8,
+    "failed": 0,
+    "max_active_observed": 8,
+    "ttfc_ms": {
+      "p50": 3506.9371755234897,
+      "p90": 8361.694634146988,
+      "p99": 8720.997716784477
+    },
+    "total_ms": {
+      "p50": 11218.443271238357,
+      "p90": 14831.042927596718,
+      "p99": 15134.59586863406
+    },
+    "rtf": {
+      "p50": 3.4272244118520208,
+      "p90": 4.9507235086560755,
+      "p99": 5.313677616911387
+    },
+    "max_chunk_gap_ms": {
+      "p50": 3306.42349133268,
+      "p90": 3374.2624536156654,
+      "p99": 3408.0436024442315
+    },
+    "gpu": {
+      "samples": 30,
+      "util_avg_pct": 24.066666666666666,
+      "util_max_pct": 30.0,
+      "memory_max_mib": 4771.0
+    }
+  },
+  "results": [
+    {
+      "request_id": 0,
+      "scheduled_delay_s": 0.0,
+      "text": "Sure, I can help with that.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 161280,
+      "audio_s": 3.36,
+      "total_ms": 7371.914775110781,
+      "ttfc_ms": 95.33472917973995,
+      "rtf": 2.1940222544972565,
+      "chunk_count": 168,
+      "max_chunk_gap_ms": 3353.6039032042027,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "69",
+      "active_at_start": 1
+    },
+    {
+      "request_id": 1,
+      "scheduled_delay_s": 0.3088764284757353,
+      "text": "The meeting starts in about ten minutes.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 168960,
+      "audio_s": 3.52,
+      "total_ms": 8752.529603429139,
+      "ttfc_ms": 144.25457082688808,
+      "rtf": 2.486514091883278,
+      "chunk_count": 176,
+      "max_chunk_gap_ms": 3274.0362249314785,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "160",
+      "active_at_start": 2
+    },
+    {
+      "request_id": 2,
+      "scheduled_delay_s": 0.5755092152782356,
+      "text": "I found three options that look useful.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 176640,
+      "audio_s": 3.68,
+      "total_ms": 9587.27249968797,
+      "ttfc_ms": 228.66032365709543,
+      "rtf": 2.6052370923065133,
+      "chunk_count": 184,
+      "max_chunk_gap_ms": 3411.7970634251833,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "82",
+      "active_at_start": 3
+    },
+    {
+      "request_id": 3,
+      "scheduled_delay_s": 0.7584333949029234,
+      "text": "Let me summarize the important part.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 149760,
+      "audio_s": 3.12,
+      "total_ms": 8239.999553188682,
+      "ttfc_ms": 346.4779444038868,
+      "rtf": 2.641025497816885,
+      "chunk_count": 156,
+      "max_chunk_gap_ms": 3358.176192268729,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "79",
+      "active_at_start": 4
+    },
+    {
+      "request_id": 4,
+      "scheduled_delay_s": 1.0513270718540593,
+      "text": "The weather should be clear this afternoon.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 115200,
+      "audio_s": 2.4,
+      "total_ms": 12849.614042788744,
+      "ttfc_ms": 6667.396406643093,
+      "rtf": 5.354005851161977,
+      "chunk_count": 120,
+      "max_chunk_gap_ms": 3259.2702098190784,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "160",
+      "active_at_start": 5
+    },
+    {
+      "request_id": 5,
+      "scheduled_delay_s": 1.1341707136984498,
+      "text": "That answer is correct for the example.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 172800,
+      "audio_s": 3.6,
+      "total_ms": 15168.323973193765,
+      "ttfc_ms": 8190.597928129137,
+      "rtf": 4.213423325887157,
+      "chunk_count": 180,
+      "max_chunk_gap_ms": 3294.5182221010327,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "82",
+      "active_at_start": 6
+    },
+    {
+      "request_id": 6,
+      "scheduled_delay_s": 1.5463575871522655,
+      "text": "Please try the shorter version first.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 142080,
+      "audio_s": 2.96,
+      "total_ms": 14142.54912827164,
+      "ttfc_ms": 7845.174811780453,
+      "rtf": 4.777888219010689,
+      "chunk_count": 148,
+      "max_chunk_gap_ms": 3274.7959922999144,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "80",
+      "active_at_start": 7
+    },
+    {
+      "request_id": 7,
+      "scheduled_delay_s": 1.7382099914593698,
+      "text": "I can check the benchmark after this run.",
+      "status_code": 200,
+      "error": null,
+      "bytes": 157440,
+      "audio_s": 3.28,
+      "total_ms": 14686.493908055127,
+      "ttfc_ms": 8760.920281521976,
+      "rtf": 4.4775896061143685,
+      "chunk_count": 164,
+      "max_chunk_gap_ms": 3318.3287605643272,
+      "streaming_mode": "decode_time_codec_stream",
+      "scheduler_mode": "scheduler_scalar",
+      "max_new_tokens_effective": "160",
+      "active_at_start": 8
+    }
+  ],
+  "gpu_samples": [
+    {
+      "t": 8021454.985608588,
+      "gpu_util_pct": 25.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021455.561757871,
+      "gpu_util_pct": 12.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021456.136805198,
+      "gpu_util_pct": 20.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021456.67508749,
+      "gpu_util_pct": 24.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021457.253173922,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021457.829632261,
+      "gpu_util_pct": 25.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021458.387141659,
+      "gpu_util_pct": 24.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021458.926925752,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021459.485315821,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021460.022510765,
+      "gpu_util_pct": 24.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021460.601105315,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021461.138347792,
+      "gpu_util_pct": 26.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021461.676672018,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021462.25296423,
+      "gpu_util_pct": 26.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021462.790372461,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021463.327384304,
+      "gpu_util_pct": 25.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021463.885610196,
+      "gpu_util_pct": 24.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021464.441129497,
+      "gpu_util_pct": 25.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021464.997136548,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021465.552986282,
+      "gpu_util_pct": 24.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021466.130286742,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021466.68564712,
+      "gpu_util_pct": 25.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021467.261625498,
+      "gpu_util_pct": 22.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021467.801607065,
+      "gpu_util_pct": 25.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021468.357839465,
+      "gpu_util_pct": 23.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021468.894592445,
+      "gpu_util_pct": 26.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021469.452929252,
+      "gpu_util_pct": 28.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021469.972760364,
+      "gpu_util_pct": 29.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021470.52913609,
+      "gpu_util_pct": 28.0,
+      "memory_used_mib": 4771.0
+    },
+    {
+      "t": 8021471.066869013,
+      "gpu_util_pct": 30.0,
+      "memory_used_mib": 4771.0
+    }
+  ]
+}

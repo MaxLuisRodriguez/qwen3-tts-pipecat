@@ -2,6 +2,17 @@
 
 This document captures the major performance-critical items that are still not implemented in the current Qwen3-TTS + Pipecat integration.
 
+As of the 2026-05-15 validation pass, the repo installs and auto-selects Flash Attention 2 when available, records per-phase TTS timing, and exposes scheduler-level scalar concurrency. The remaining work below is still required before claiming a true batch-4 CUDA submission.
+
+Measured short-turn timing with synchronized probes on `text=ready`, `voice=vivian`, `max_new_tokens=64`:
+
+- prefill: `220.7 ms`
+- subtalker/code predictor: `1259.6 ms`
+- talker custom-kernel decode: `33.5 ms`
+- speech tokenizer/audio decode: `281.9 ms`
+
+The top measured bottleneck is currently the PyTorch subtalker/code predictor path, followed by speech tokenizer/audio decode and prefill. The custom talker decode kernel is being called, but it is no longer the dominant measured cost on this short prompt.
+
 ## 1. Megakernel talker prefill
 
 Talker prefill is still done through the Hugging Face model path rather than a specialized megakernel prefill path.
@@ -126,14 +137,23 @@ Why it matters:
 - Cadence tuning helps, but it is not the same as overlapping independent work on separate streams.
 - A true overlap pipeline could improve steady-state RTF.
 
+## 8. No true batched CUDA talker kernel yet
+
+The service can admit multiple TTS requests through scheduler-level scalar backend slots, but the CUDA talker decode path itself is still invoked per request. This is useful for measurement and request lifecycle work, but it should not be reported as true batched megakernel execution.
+
+Why it matters:
+- Batch-4 serving can now be benchmarked honestly at the scheduler/API level.
+- The kernel still needs batch-aware KV/cache layout and batched decode entrypoints before it is a true batch-4 CUDA implementation.
+
 ## Priority Order
 
 If optimizing for the next biggest wins, the likely order is:
 
-1. Megakernel or otherwise specialized talker prefill
-2. Fully fused fp32 LM-head/token selection path
-3. CUDA-graph or similar launch-overhead reduction for the TTS hot loop
-4. Subtalker kernel specialization
-5. Better overlap between talker generation and tokenizer/audio decode
-6. Speech tokenizer custom-kernel acceleration
-7. Speculative or chunkwise multi-frame decode
+1. Subtalker/code predictor kernel specialization or graph capture
+2. Better overlap between talker generation and tokenizer/audio decode
+3. Speech tokenizer custom-kernel acceleration
+4. Megakernel or otherwise specialized talker prefill
+5. Fully fused fp32 LM-head/token selection path
+6. CUDA-graph or similar launch-overhead reduction for the TTS hot loop
+7. True batched CUDA talker decode with batch-aware KV/cache layout
+8. Speculative or chunkwise multi-frame decode

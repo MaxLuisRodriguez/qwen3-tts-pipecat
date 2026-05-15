@@ -1,0 +1,9 @@
+request_id,scheduled_delay_s,text,status_code,error,bytes,audio_s,total_ms,ttfc_ms,rtf,chunk_count,max_chunk_gap_ms,streaming_mode,scheduler_mode,max_new_tokens_effective,active_at_start
+0,0.0,"Sure, I can help with that.",200,,161280,3.36,7371.914775110781,95.33472917973995,2.1940222544972565,168,3353.6039032042027,decode_time_codec_stream,scheduler_scalar,69,1
+1,0.3088764284757353,The meeting starts in about ten minutes.,200,,168960,3.52,8752.529603429139,144.25457082688808,2.486514091883278,176,3274.0362249314785,decode_time_codec_stream,scheduler_scalar,160,2
+2,0.5755092152782356,I found three options that look useful.,200,,176640,3.68,9587.27249968797,228.66032365709543,2.6052370923065133,184,3411.7970634251833,decode_time_codec_stream,scheduler_scalar,82,3
+3,0.7584333949029234,Let me summarize the important part.,200,,149760,3.12,8239.999553188682,346.4779444038868,2.641025497816885,156,3358.176192268729,decode_time_codec_stream,scheduler_scalar,79,4
+4,1.0513270718540593,The weather should be clear this afternoon.,200,,115200,2.4,12849.614042788744,6667.396406643093,5.354005851161977,120,3259.2702098190784,decode_time_codec_stream,scheduler_scalar,160,5
+5,1.1341707136984498,That answer is correct for the example.,200,,172800,3.6,15168.323973193765,8190.597928129137,4.213423325887157,180,3294.5182221010327,decode_time_codec_stream,scheduler_scalar,82,6
+6,1.5463575871522655,Please try the shorter version first.,200,,142080,2.96,14142.54912827164,7845.174811780453,4.777888219010689,148,3274.7959922999144,decode_time_codec_stream,scheduler_scalar,80,7
+7,1.7382099914593698,I can check the benchmark after this run.,200,,157440,3.28,14686.493908055127,8760.920281521976,4.4775896061143685,164,3318.3287605643272,decode_time_codec_stream,scheduler_scalar,160,8

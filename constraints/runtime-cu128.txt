@@ -5,3 +5,4 @@ torchaudio==2.7.0+cu128
 triton==3.3.0
 transformers==4.57.3
 qwen-tts==0.1.1
+flash-attn==2.8.3
