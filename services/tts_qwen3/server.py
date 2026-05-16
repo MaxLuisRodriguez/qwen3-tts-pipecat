@@ -30,6 +30,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from megakernel_talker import TalkerMegakernelBackend
+from subtalker_batch_service import SubtalkerBatchService, service_enabled as _subtalker_batch_enabled
 
 app = FastAPI(title="Qwen3 TTS Service")
 LOGGER = logging.getLogger(__name__)
@@ -366,6 +367,7 @@ class Qwen3TTSEngine:
         ) == "1"
         self._model = None
         self._backend: TalkerMegakernelBackend | None = None
+        self._subtalker_service: SubtalkerBatchService | None = None
         self._scheduler = TTSRequestScheduler(self)
 
     @property
@@ -387,19 +389,50 @@ class Qwen3TTSEngine:
             self._model.model.eval()
             if self._device.type != "cuda":
                 self._model.model.to(self._device)
+
+            # Build one shared SubtalkerBatchService that all backend slots
+            # route their subtalker forwards through. This is the Stage 1
+            # batching optimization: per-slot Python orchestration is
+            # decoupled from GPU forwards, and the compile cache is shared.
+            if _subtalker_batch_enabled():
+                subtalker = self._model.model.talker.code_predictor.model
+                self._subtalker_service = SubtalkerBatchService(subtalker)
+                talker_hidden = int(self._model.model.talker.config.hidden_size)
+                subtalker_hidden = int(subtalker.config.hidden_size)
+                # The service expects inputs already projected through
+                # small_to_mtp_projection (which maps talker_hidden ->
+                # subtalker_hidden), so warmup tensors use subtalker_hidden.
+                self._subtalker_service.warmup(
+                    hidden_size=subtalker_hidden,
+                    device=self._model.model.talker.device,
+                    dtype=self._model.model.talker.dtype,
+                    batch_sizes=(1, 2, 4),
+                )
+                LOGGER.info(
+                    "Subtalker batching service initialized "
+                    "(compile=%s talker_hidden=%d subtalker_hidden=%d)",
+                    self._subtalker_service.compile_enabled,
+                    talker_hidden,
+                    subtalker_hidden,
+                )
+
             target_backends = self._scheduler.max_active if self._prewarm_backends else 1
             for idx in range(target_backends):
-                backend = TalkerMegakernelBackend(self._model)
+                backend = TalkerMegakernelBackend(
+                    self._model,
+                    subtalker_service=self._subtalker_service,
+                )
                 backend.warm_prefill_scaffold(self.default_voice, self.default_language)
                 if idx == 0:
                     self._backend = backend
                 self._backend_pool.put(backend)
                 self._backend_count += 1
             LOGGER.info(
-                "Loaded Qwen3-TTS with %d backend slot(s), prewarm_backends=%s, prefill_optimized=%s",
+                "Loaded Qwen3-TTS with %d backend slot(s), prewarm_backends=%s, prefill_optimized=%s, subtalker_batch=%s",
                 self._backend_count,
                 self._prewarm_backends,
                 os.getenv("QWEN3_TTS_PREFILL_OPTIMIZED", "1") == "1",
+                self._subtalker_service is not None,
             )
 
     def checkout_backend(self) -> TalkerMegakernelBackend:
@@ -407,7 +440,7 @@ class Qwen3TTSEngine:
         if self._model is None:
             raise RuntimeError("Qwen3-TTS model is not loaded.")
         if self._rebuild_backend_per_request:
-            return TalkerMegakernelBackend(self._model)
+            return TalkerMegakernelBackend(self._model, subtalker_service=self._subtalker_service)
         try:
             return self._backend_pool.get_nowait()
         except queue.Empty:
@@ -416,7 +449,9 @@ class Qwen3TTSEngine:
             if self._backend_count < self._scheduler.max_active:
                 self._backend_count += 1
                 try:
-                    backend = TalkerMegakernelBackend(self._model)
+                    backend = TalkerMegakernelBackend(
+                        self._model, subtalker_service=self._subtalker_service
+                    )
                     backend.warm_prefill_scaffold(self.default_voice, self.default_language)
                     return backend
                 except Exception:

@@ -165,9 +165,11 @@ class IncrementalTokenizerDecoderV2:
 class TalkerMegakernelBackend:
     """Runs Qwen3-TTS talker decode with megakernel and streams decode-time audio."""
 
-    def __init__(self, qwen_tts_model):
+    def __init__(self, qwen_tts_model, *, subtalker_service=None):
         # Trigger extension build/load.
         import qwen_megakernel  # noqa: F401
+
+        self._subtalker_service = subtalker_service
 
         self._decode_from_hidden = torch.ops.qwen_megakernel_C.decode_from_hidden
         self._decode_hidden_only = torch.ops.qwen_megakernel_C.decode_hidden_only
@@ -222,13 +224,29 @@ class TalkerMegakernelBackend:
         # subtalker's attention impl to sdpa because flash_attention_2 thrashes
         # the dynamo recompile limit on shape-changing KV cache strides. The
         # talker still uses its original attn impl.
+        #
+        # When a SubtalkerBatchService is attached, the compile wrapper lives
+        # on the service so the dynamo compile cache is shared across all
+        # backend slots. Each backend would otherwise build its own
+        # ``torch.compile`` wrapper redundantly.
         self._subtalker_compile_enabled = (
             os.getenv("QWEN3_TTS_SUBTALKER_COMPILE", "1") == "1"
             and torch.cuda.is_available()
         )
         self._subtalker_model_compiled = self._subtalker_model
         self._subtalker_compile_warmed = False
-        if self._subtalker_compile_enabled:
+        if self._subtalker_service is not None:
+            # Service owns the compile wrapper.
+            self._subtalker_compile_enabled = bool(self._subtalker_service.compile_enabled)
+            self._subtalker_compile_warmed = True
+            # Mark attn impl so any direct fallback call also uses sdpa.
+            try:
+                self._subtalker_model.config._attn_implementation = "sdpa"
+                for layer in self._subtalker_model.layers:
+                    setattr(layer.self_attn, "_attn_implementation", "sdpa")
+            except Exception:
+                pass
+        elif self._subtalker_compile_enabled:
             try:
                 self._subtalker_model.config._attn_implementation = "sdpa"
                 # Mark layer attention type cached value if present.
@@ -486,6 +504,10 @@ class TalkerMegakernelBackend:
         requests, then the second pass confirms all shape variants are cached.
         Idempotent.
         """
+        if self._subtalker_service is not None:
+            # Service owns the compiled wrapper + warmup.
+            self._subtalker_compile_warmed = True
+            return
         if not self._subtalker_compile_enabled or self._subtalker_compile_warmed:
             return
         with torch.inference_mode():
@@ -1000,6 +1022,11 @@ class TalkerMegakernelBackend:
 
         This replaces the generic HF `generate()` loop with a cache-reusing
         path specialized to Qwen3-TTS's fixed `num_code_groups - 1` decode.
+
+        When a ``SubtalkerBatchService`` is attached, each forward is
+        dispatched through the service so multiple concurrent slots can be
+        merged into a single batched forward, decoupling per-slot Python
+        orchestration from GPU throughput.
         """
         frame_codes = torch.empty(self._num_code_groups, dtype=torch.long, device=self._device)
         frame_codes[0] = first_token.view(-1)[0]
@@ -1007,17 +1034,29 @@ class TalkerMegakernelBackend:
 
         self._subtalker_prefill_buf[:, :1].copy_(past_hidden)
         self._subtalker_prefill_buf[:, 1:2].copy_(first_hidden)
-        outputs = self._subtalker_model_compiled(
-            input_ids=None,
-            inputs_embeds=self._subtalker_projection(self._subtalker_prefill_buf),
-            past_key_values=None,
-            use_cache=True,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-        kv_cache = outputs.past_key_values
-        hidden = outputs.last_hidden_state[:, -1, :]
+        prefill_embeds = self._subtalker_projection(self._subtalker_prefill_buf)
+
+        if self._subtalker_service is not None:
+            hidden, kv_cache = self._subtalker_service.submit(
+                inputs_embeds=prefill_embeds,
+                past_key_values=None,
+                do_sample=do_sample,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+            )
+        else:
+            outputs = self._subtalker_model_compiled(
+                input_ids=None,
+                inputs_embeds=prefill_embeds,
+                past_key_values=None,
+                use_cache=True,
+                output_attentions=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            kv_cache = outputs.past_key_values
+            hidden = outputs.last_hidden_state[:, -1, :]
 
         for group_idx in range(self._num_subtalker_steps):
             logits = self._subtalker_output_heads[group_idx](hidden)
@@ -1036,17 +1075,29 @@ class TalkerMegakernelBackend:
             if group_idx + 1 >= self._num_subtalker_steps:
                 break
 
-            outputs = self._subtalker_model_compiled(
-                input_ids=None,
-                inputs_embeds=self._subtalker_projection(next_embed),
-                past_key_values=kv_cache,
-                use_cache=True,
-                output_attentions=False,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-            kv_cache = outputs.past_key_values
-            hidden = outputs.last_hidden_state[:, -1, :]
+            cont_embeds = self._subtalker_projection(next_embed)
+
+            if self._subtalker_service is not None:
+                hidden, kv_cache = self._subtalker_service.submit(
+                    inputs_embeds=cont_embeds,
+                    past_key_values=kv_cache,
+                    do_sample=do_sample,
+                    top_p=top_p,
+                    top_k=top_k,
+                    temperature=temperature,
+                )
+            else:
+                outputs = self._subtalker_model_compiled(
+                    input_ids=None,
+                    inputs_embeds=cont_embeds,
+                    past_key_values=kv_cache,
+                    use_cache=True,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                kv_cache = outputs.past_key_values
+                hidden = outputs.last_hidden_state[:, -1, :]
 
         return frame_codes, codec_sum
 

@@ -22,6 +22,7 @@ if ROOT_DIR not in sys.path:
 
 from qwen_tts import Qwen3TTSModel  # noqa: E402
 from services.tts_qwen3.megakernel_talker import TalkerMegakernelBackend  # noqa: E402
+from services.tts_qwen3.subtalker_batch_service import SubtalkerBatchService  # noqa: E402
 
 
 @dataclass
@@ -92,6 +93,11 @@ def parse_args() -> argparse.Namespace:
         default=-1.0,
         help="Optional waveform prefix correlation floor. Disabled by default because codec timing can shift.",
     )
+    parser.add_argument(
+        "--use-subtalker-service",
+        action="store_true",
+        help="Route subtalker forwards through SubtalkerBatchService to test the batched path.",
+    )
     parser.add_argument("--skip-official", action="store_true", help="Only check optimized backend construction and streaming.")
     parser.add_argument("--skip-kernel-parity", action="store_true", help="Skip first-step custom-kernel vs PyTorch parity.")
     parser.add_argument(
@@ -117,7 +123,16 @@ def main() -> None:
     )
     model.model.eval()
 
-    backend = TalkerMegakernelBackend(model)
+    subtalker_service = None
+    if args.use_subtalker_service:
+        subtalker_model = model.model.talker.code_predictor.model
+        subtalker_service = SubtalkerBatchService(subtalker_model)
+        subtalker_service.warmup(
+            hidden_size=int(subtalker_model.config.hidden_size),
+            device=model.model.talker.device,
+            dtype=model.model.talker.dtype,
+        )
+    backend = TalkerMegakernelBackend(model, subtalker_service=subtalker_service)
     stats, audio_iter = backend.stream_audio(
         text=args.text,
         speaker=args.voice,
