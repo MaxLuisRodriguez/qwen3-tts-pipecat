@@ -41,6 +41,7 @@ class StreamStats:
     timing_mode: str = "wall_async"
     audio_decode_overlap: bool = False
     audio_decode_wait_ms: float = 0.0
+    subtalker_compile: bool = False
 
 
 class IncrementalTokenizerDecoderV2:
@@ -216,6 +217,31 @@ class TalkerMegakernelBackend:
         self._prefill_kernel_max_seq_len = int(
             os.getenv("QWEN3_TTS_PREFILL_KERNEL_MAX_SEQ_LEN", "96")
         )
+
+        # Subtalker compile (torch.compile) optimization. Switches the
+        # subtalker's attention impl to sdpa because flash_attention_2 thrashes
+        # the dynamo recompile limit on shape-changing KV cache strides. The
+        # talker still uses its original attn impl.
+        self._subtalker_compile_enabled = (
+            os.getenv("QWEN3_TTS_SUBTALKER_COMPILE", "1") == "1"
+            and torch.cuda.is_available()
+        )
+        self._subtalker_model_compiled = self._subtalker_model
+        self._subtalker_compile_warmed = False
+        if self._subtalker_compile_enabled:
+            try:
+                self._subtalker_model.config._attn_implementation = "sdpa"
+                # Mark layer attention type cached value if present.
+                for layer in self._subtalker_model.layers:
+                    setattr(layer.self_attn, "_attn_implementation", "sdpa")
+                self._subtalker_model_compiled = torch.compile(
+                    self._subtalker_model,
+                    mode="default",
+                    dynamic=True,
+                )
+            except Exception:
+                self._subtalker_compile_enabled = False
+                self._subtalker_model_compiled = self._subtalker_model
 
         self._layer_weights_packed = self._pack_layer_weights()
         self._final_norm_weight = self._talker.model.norm.weight.contiguous()
@@ -447,10 +473,45 @@ class TalkerMegakernelBackend:
 
     def warm_prefill_scaffold(self, speaker: str, language: str = "auto") -> None:
         """Populate request-independent prompt scaffold tensors for a backend slot."""
-        if not self._prefill_optimized:
+        if self._prefill_optimized:
+            with torch.inference_mode():
+                self._get_prompt_scaffold(speaker, language, self._non_streaming_text_mode)
+        self.warm_subtalker_compile()
+
+    def warm_subtalker_compile(self) -> None:
+        """Trigger torch.compile of the subtalker so the first request doesn't pay it.
+
+        Runs two synthetic frames through ``_predict_subtalker_frame`` so the
+        compiled path sees the exact same call site / cache progression as real
+        requests, then the second pass confirms all shape variants are cached.
+        Idempotent.
+        """
+        if not self._subtalker_compile_enabled or self._subtalker_compile_warmed:
             return
         with torch.inference_mode():
-            self._get_prompt_scaffold(speaker, language, self._non_streaming_text_mode)
+            try:
+                first_token = torch.zeros((1,), dtype=torch.long, device=self._device)
+                first_hidden = torch.zeros(
+                    (1, 1, self._hidden_size), device=self._device, dtype=torch.bfloat16
+                )
+                past_hidden = torch.zeros(
+                    (1, 1, self._hidden_size), device=self._device, dtype=torch.bfloat16
+                )
+                for _ in range(2):
+                    self._predict_subtalker_frame(
+                        first_token=first_token,
+                        first_hidden=first_hidden,
+                        past_hidden=past_hidden,
+                        do_sample=False,
+                        top_p=1.0,
+                        top_k=0,
+                        temperature=0.0,
+                    )
+                torch.cuda.synchronize()
+                self._subtalker_compile_warmed = True
+            except Exception:
+                self._subtalker_compile_enabled = False
+                self._subtalker_model_compiled = self._subtalker_model
 
     def _get_projected_text_hidden(self, text: str) -> torch.Tensor:
         if not self._anti_cheat_mode():
@@ -946,7 +1007,7 @@ class TalkerMegakernelBackend:
 
         self._subtalker_prefill_buf[:, :1].copy_(past_hidden)
         self._subtalker_prefill_buf[:, 1:2].copy_(first_hidden)
-        outputs = self._subtalker_model(
+        outputs = self._subtalker_model_compiled(
             input_ids=None,
             inputs_embeds=self._subtalker_projection(self._subtalker_prefill_buf),
             past_key_values=None,
@@ -975,7 +1036,7 @@ class TalkerMegakernelBackend:
             if group_idx + 1 >= self._num_subtalker_steps:
                 break
 
-            outputs = self._subtalker_model(
+            outputs = self._subtalker_model_compiled(
                 input_ids=None,
                 inputs_embeds=self._subtalker_projection(next_embed),
                 past_key_values=kv_cache,
@@ -999,6 +1060,7 @@ class TalkerMegakernelBackend:
         decode_stride: int = 4,
     ) -> tuple[StreamStats, Iterator[np.ndarray]]:
         stats = StreamStats()
+        stats.subtalker_compile = bool(self._subtalker_compile_enabled)
 
         def _run() -> Iterator[np.ndarray]:
             effective_decode_stride = max(1, int(decode_stride))

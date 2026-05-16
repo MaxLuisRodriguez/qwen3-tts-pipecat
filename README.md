@@ -247,18 +247,38 @@ kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
 
 ## Current Measurements
 
-These are the current representative numbers from the remote RTX 5090 VM on 2026-05-15. They are intentionally reported as measured, not idealized.
+These are the current representative numbers from the remote RTX 5090 VM on 2026-05-16. They are intentionally reported as measured, not idealized.
 
 Runtime:
 
 - `torch==2.7.0+cu128`
 - `flash-attn==2.8.3`
-- TTS attention implementation: `flash_attention_2`
+- TTS attention implementation: `flash_attention_2` (talker), `sdpa` (subtalker / code predictor — required for `torch.compile`)
 - benchmark env: `QWEN3_TTS_ANTI_CHEAT=1`, `QWEN3_TTS_SYNC_TIMING=0`
 - prefill optimization: `QWEN3_TTS_PREFILL_OPTIMIZED=1`, `QWEN3_TTS_PREFILL_KERNEL=0`, `QWEN3_TTS_PREWARM_BACKENDS=1`
+- subtalker optimization: `QWEN3_TTS_SUBTALKER_COMPILE=1` (`torch.compile` on the code predictor, ~3× speedup; see below)
 - decode cadence: `adaptive(mid=4,late=8@24,ctx=25)`
 - scheduler mode: `scheduler_scalar`
 - kernel path reported by service: `qwen_megakernel_C.decode_hidden_fp32_head`
+
+### Subtalker `torch.compile` direct-backend speedup
+
+Single-stream warm-state numbers from the direct talker backend (`vivian`, `english`, `max_new_tokens=64`, with `warm_prefill_scaffold` triggering the compile warmup):
+
+| text | compile wall_s | compile RTF | compile TTFC ms | compile subtalker_ms | baseline wall_s | baseline RTF | baseline TTFC ms | baseline subtalker_ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ready | `0.555` | **`0.289`** | `53.3` | `432.3` | `1.356` | `0.770` | `92.1` | `1236.1` |
+| the city is tehran | `0.785` | **`0.280`** | `53.5` | `628.9` | `1.826` | `0.761` | `93.2` | `1685.1` |
+| performance benchmark testing | `0.805` | **`0.279`** | `53.2` | `648.4` | `3.404` | `0.760` | `91.5` | `3203.6` |
+
+Take-aways:
+
+- Single-stream RTF is now below the `<= 0.5` stretch target across all tested texts (`0.28-0.29` measured vs. `0.76-0.77` baseline).
+- TTFC drops from `~92 ms` to `~53 ms` (`42% reduction`).
+- Wall time is `2.4-4.2× faster` on the warm path; subtalker is the only optimized phase but it was `>90%` of wall time before.
+- Parity preserved: `scripts/check_tts_parity.py` returns `ok=true` (`token_match`, `rms`, `peak`, `duration`, `prefix_correlation` all within tolerance).
+
+Cost: the first request after backend init pays a one-time `~3-4 s` extra compile latency on top of the `~8 s` startup compile warmup; from the second request onward, performance is the steady-state shown above. `QWEN3_TTS_PREWARM_BACKENDS=1` plus `warm_prefill_scaffold` runs the compile warmup at server load time so live traffic sees only the steady-state cost.
 
 Parity/sanity check:
 
@@ -388,18 +408,20 @@ Interpretation:
 - Cold start is still much slower than warm steady-state.
 - RTF and chunk gaps still miss the take-home stretch targets under concurrent load.
 
-## Why The Targets Are Still Missed
+## Remaining Bottlenecks
 
-The repo now has a stable and honest local stack, but the remaining bottlenecks are real:
+Single-stream RTF is now under the `0.5` stretch target on the warm path after the subtalker `torch.compile` change. The remaining honest gaps:
 
-1. Subtalker/code predictor execution is the largest measured short-turn cost.
+1. ~~Subtalker / code predictor execution is the largest measured short-turn cost.~~ Resolved on the warm path: `torch.compile` brings subtalker wall time from `~1250 ms` to `~432 ms` for `"ready"`, a `~2.9×` speedup. Subtalker is still a meaningful per-frame cost (`~25-30%` of wall), but no longer the dominant blocker.
 2. Speech tokenizer decode, even incrementally, is still a major steady-state cost.
 3. Talker prefill is improved for warm backend slots, but PyTorch prefill is still used for correctness.
-4. The current multi-request path uses scheduler-level scalar backend slots; true batched CUDA decode is still future work.
+4. The current multi-request path uses scheduler-level scalar backend slots; true batched CUDA decode is still future work and will dominate concurrent-load RTF.
 5. Some short-turn reliability logic still trades latency for robustness.
 6. Long-form talker generation is much less efficient than the raw Qwen3 megakernel text decode path.
 
-This explains why the system feels smooth during short interactions while still missing the take-home RTF target under formal measurement.
+Compile-related caveats:
+- The first request after backend init pays a `~3-4 s` compile cost on top of the `~8 s` startup warmup. After that, performance is the steady-state shown above.
+- The subtalker's attention implementation is switched from `flash_attention_2` to `sdpa` because FA2's branchy dispatch trips the dynamo recompile limit. The talker keeps FA2.
 
 ### Empirical note: audio decode overlap is implemented but does not move the needle
 

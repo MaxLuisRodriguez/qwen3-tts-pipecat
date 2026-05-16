@@ -1,0 +1,8 @@
+[compile] warmup done
+[compile] 'ready': wall=0.555s rtf=0.289 ttfc=53.3ms subt=432.3
+[compile] 'the city is tehran': wall=0.785s rtf=0.280 ttfc=53.5ms subt=628.9
+[compile] 'performance benchmark testing': wall=0.805s rtf=0.279 ttfc=53.2ms subt=648.4
+[baseline] warmup done
+[baseline] 'ready': wall=1.356s rtf=0.770 ttfc=92.1ms subt=1236.1
+[baseline] 'the city is tehran': wall=1.826s rtf=0.761 ttfc=93.2ms subt=1685.1
+[baseline] 'performance benchmark testing': wall=3.404s rtf=0.760 ttfc=91.5ms subt=3203.6

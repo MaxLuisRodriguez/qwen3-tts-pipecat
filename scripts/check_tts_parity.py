@@ -158,6 +158,7 @@ def main() -> None:
             "timing_mode": stats.timing_mode,
             "audio_decode_overlap": stats.audio_decode_overlap,
             "audio_decode_wait_ms": stats.audio_decode_wait_ms,
+            "subtalker_compile": stats.subtalker_compile,
         },
         "kernel_first_step_parity": None,
         "official": None,

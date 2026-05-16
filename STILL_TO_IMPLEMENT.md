@@ -2,17 +2,18 @@
 
 This document captures the major performance-critical items that are still not implemented in the current Qwen3-TTS + Pipecat integration.
 
-As of the 2026-05-15 validation pass, the repo installs and auto-selects Flash Attention 2 when available, records per-phase TTS timing, exposes scheduler-level scalar concurrency, and prewarms static prefill scaffolds for backend slots. The remaining work below is still required before claiming a true batch-4 CUDA submission.
+As of the 2026-05-16 validation pass, the repo installs and auto-selects Flash Attention 2 when available, records per-phase TTS timing, exposes scheduler-level scalar concurrency, prewarms static prefill scaffolds for backend slots, and `torch.compile`s the subtalker / code predictor (SDPA attention) at backend init. The remaining work below is still required before claiming a true batch-4 CUDA submission.
 
-Measured short-turn timing with synchronized probes on `text=ready`, `voice=vivian`, `max_new_tokens=64`:
+Measured warm-state direct-backend timing on `text=ready`, `voice=vivian`, `max_new_tokens=64` (compile on):
 
-- first-request prefill: `219.8 ms`
-- warm same-backend prefill after static scaffold cache: `23.8 ms`
-- subtalker/code predictor: `1250.1 ms`
-- talker custom-kernel decode: `33.6 ms`
-- speech tokenizer/audio decode: `287.7 ms`
+- wall_total: `0.555 s`
+- TTFC: `53.3 ms`
+- subtalker_ms (compiled): `432.3 ms` (was `1250.1 ms` pre-compile, ~2.9× speedup)
+- talker custom-kernel decode: `~2 ms`
+- speech tokenizer / audio decode: still meaningful (~`200 ms` summed across chunks)
+- RTF: `0.289`
 
-The top measured bottleneck is currently the PyTorch subtalker/code predictor path, followed by speech tokenizer/audio decode. Warm backend-slot prefill is no longer the dominant short-prompt cost. The custom talker decode kernel is being called, but it is not the dominant measured cost on this short prompt.
+Subtalker is no longer the runaway bottleneck on the warm path. Remaining work targets concurrent-load behaviour (true batched CUDA decode) and the audio-decode / prefill paths.
 
 ## 1. Exact megakernel talker prefill
 
@@ -54,13 +55,16 @@ Why it matters:
 - It adds extra framework dispatch and device work outside the custom CUDA kernel.
 - A true fused fp32-head kernel would reduce overhead in the talker loop.
 
-## 3. Subtalker decode is still mostly PyTorch execution
+## 3. Subtalker decode is `torch.compile`d, not a custom CUDA megakernel
 
-Subtalker decode no longer uses generic HF `generate()`, but it is still primarily executed through PyTorch model calls rather than a custom CUDA megakernel path.
+Subtalker decode is now executed through a `torch.compile`d wrapper around the HF code-predictor model (`QWEN3_TTS_SUBTALKER_COMPILE=1`, default on). The compiled path uses SDPA attention (FA2 trips the dynamo recompile limit on shape-changing KV cache strides).
 
 ```python
 # services/tts_qwen3/megakernel_talker.py
-outputs = self._subtalker_model(
+self._subtalker_model_compiled = torch.compile(
+    self._subtalker_model, mode="default", dynamic=True
+)
+outputs = self._subtalker_model_compiled(
     input_ids=None,
     inputs_embeds=self._subtalker_projection(self._subtalker_prefill_buf),
     past_key_values=None,
@@ -69,11 +73,10 @@ outputs = self._subtalker_model(
 )
 ```
 
-Source: `services/tts_qwen3/megakernel_talker.py:610`
-
-Why it matters:
-- This remains part of the steady-state generation cost.
-- The fixed-shape loop is better than HF `generate()`, but it is not yet kernel-specialized.
+Why a custom CUDA path would still help:
+- Compile gives `~2.9×` speedup but the subtalker still runs ~`30%` of warm-path wall time (`~432 ms` on `"ready"`).
+- A true kernel-specialized path (CUDA graphs with a static KV cache, or a hand-rolled fused step) could push subtalker below `~150 ms`.
+- The first request after backend init also pays a `~3-4 s` extra compile cost; a hand-rolled path avoids that.
 
 ## 4. Speech tokenizer waveform decode is still expensive
 

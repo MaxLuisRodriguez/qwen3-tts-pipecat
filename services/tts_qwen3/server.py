@@ -291,6 +291,7 @@ class TTSRequestScheduler:
                 "timing_mode",
                 "audio_decode_overlap",
                 "audio_decode_wait_ms",
+                "subtalker_compile",
             ):
                 if hasattr(raw_stats, attr):
                     setattr(state.stats, attr, getattr(raw_stats, attr))
@@ -302,7 +303,7 @@ class TTSRequestScheduler:
                 "generation_s=%.3f audio_s=%.3f frames=%s chunks=%s "
                 "prefill_mode=%s prefill_ms=%.2f prompt_ms=%.2f prefill_model_ms=%.2f "
                 "prefill_cache_ms=%.2f subtalker_ms=%.2f talker_decode_ms=%.2f audio_decode_ms=%.2f "
-                "audio_decode_overlap=%s",
+                "audio_decode_overlap=%s subtalker_compile=%s",
                 state.request_id,
                 self.mode,
                 state.batch_admit_size,
@@ -320,6 +321,7 @@ class TTSRequestScheduler:
                 float(getattr(state.stats, "talker_decode_ms", 0.0) or 0.0),
                 float(getattr(state.stats, "audio_decode_ms", 0.0) or 0.0),
                 bool(getattr(state.stats, "audio_decode_overlap", False)),
+                bool(getattr(state.stats, "subtalker_compile", False)),
             )
         except BaseException as exc:
             state.error = exc
