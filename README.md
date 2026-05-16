@@ -4,7 +4,7 @@ This repo adapts AlpinDale's `qwen_megakernel` decode kernel to run the Qwen3-TT
 
 `Deepgram STT -> Megakernel LLM service -> Local Qwen3-TTS talker service -> Daily audio output`
 
-The original take-home prompt is no longer stored in the repo; this README is the current source of run, benchmark, and limitation notes.
+This README is the source of run, benchmark, and limitation notes. The narrative of how the numbers got here lives in `PERFORMANCE_NOTES.md`.
 
 ## What Is Working
 
@@ -14,10 +14,8 @@ The original take-home prompt is no longer stored in the repo; this README is th
 - Decode-time audio streaming to Pipecat without full-utterance buffering
 - Binary TTS path pushes chunks to Pipecat immediately as they are decoded
 - Scheduler-level multi-request TTS serving with up to 4 scalar backend slots
-- **Cross-slot subtalker batching** via `SubtalkerBatchService`: all four slots' subtalker forwards are routed through a single owner thread that gathers them in a `~1.5 ms` adaptive window and runs one batched forward. This takes concurrent c4 GPU util from `~18%` to `~97%` and c4 RTF p50 from `2.64` to `0.59`.
+- Cross-slot subtalker batching via `SubtalkerBatchService`: all four slots' subtalker forwards are routed through a single owner thread that gathers them in a `~1.5 ms` adaptive window and runs one batched forward
 - End-to-end voice turns with live terminal metrics
-
-The pipeline is stable for short voice interactions, hits real-time on single streams (RTF p50 `0.47`), and stays under real-time on concurrent c4 traffic (RTF p50 `0.59`).
 
 A Python-side dispatcher for a future true batched CUDA talker megakernel (`QWEN3_TTS_TALKER_BATCH=1`) is committed as scaffolding but off by default — see `services/tts_qwen3/batched_talker_service.py` and `STILL_TO_IMPLEMENT.md` for what the CUDA-side work requires.
 
@@ -51,11 +49,9 @@ The TTS service streams PCM while the utterance is being generated:
 - `/synthesize_binary` does not front-buffer a non-silent prefix before returning the streaming response
 - the speech tokenizer decode is stateful/incremental within a request
 
-### 4. Cross-slot subtalker batching for concurrent throughput
+### 4. Cross-slot subtalker batching
 
-The concurrent c4 path used to collapse to RTF `2.64` with GPU util `18.6%`. The bottleneck was not GPU compute — it was the GIL serializing four worker threads, each making 8 subtalker forwards per frame through the same `torch.compile`d module.
-
-`SubtalkerBatchService` ([services/tts_qwen3/subtalker_batch_service.py](/root/qwen3-tts-pipecat/services/tts_qwen3/subtalker_batch_service.py)) owns the compiled subtalker and serves all four slots from a single owner thread:
+`SubtalkerBatchService` ([services/tts_qwen3/subtalker_batch_service.py](/root/qwen3-tts-pipecat/services/tts_qwen3/subtalker_batch_service.py)) owns the compiled subtalker and serves all four backend slots from a single owner thread:
 
 - Slots submit `(inputs_embeds, past_key_values, sampling)` to a condition-variable queue.
 - The owner thread gathers submissions arriving within a `1.5 ms` adaptive window, groups them by sampling parameters + KV sequence length, concatenates per-layer K/V along the batch dim, runs one batched forward, and splits per-row outputs / updated `DynamicCache` rows back to the submitting threads.
@@ -63,8 +59,6 @@ The concurrent c4 path used to collapse to RTF `2.64` with GPU util `18.6%`. The
 - The owner thread runs inside `torch.inference_mode()` so dispatch keys match the warmup tensors.
 - Adaptive window suppresses the wait when the previous served batch was a singleton, so single-stream traffic doesn't pay the batching latency floor.
 - Warmup driver exercises the same code paths for `B ∈ {1..4}`, `kv_len ∈ {0..7}` at server load.
-
-Result: c4 RTF p50 `2.64 → 0.59`, GPU util avg `18.6% → 97.1%`, parity preserved. Single-stream RTF also improved (`0.78 → 0.47`) because the compile cache is now shared across slots.
 
 ### 5. Hardened short-turn stability without changing providers
 
@@ -83,7 +77,7 @@ No external TTS fallback was introduced; all results reflect the performance of 
 - [services/llm_megakernel/](/root/qwen3-tts-pipecat/services/llm_megakernel): FastAPI SSE LLM service
 - [services/tts_qwen3/](/root/qwen3-tts-pipecat/services/tts_qwen3): FastAPI streaming TTS service
 - [services/tts_qwen3/subtalker_batch_service.py](/root/qwen3-tts-pipecat/services/tts_qwen3/subtalker_batch_service.py): cross-slot batched subtalker dispatcher (default on)
-- [services/tts_qwen3/batched_talker_service.py](/root/qwen3-tts-pipecat/services/tts_qwen3/batched_talker_service.py): Stage-2 scaffolding for batched talker megakernel (default off)
+- [services/tts_qwen3/batched_talker_service.py](/root/qwen3-tts-pipecat/services/tts_qwen3/batched_talker_service.py): scaffolding for batched talker megakernel (default off)
 - [pipecat_demo/](/root/qwen3-tts-pipecat/pipecat_demo): Daily/Pipecat voice bot
 - [scripts/bootstrap_qwen_megakernel.sh](/root/qwen3-tts-pipecat/scripts/bootstrap_qwen_megakernel.sh): bootstrap/runtime setup
 - [scripts/run_local.sh](/root/qwen3-tts-pipecat/scripts/run_local.sh): one-command local demo
@@ -104,8 +98,6 @@ bash scripts/bootstrap_qwen_megakernel.sh
 Bootstrap creates `kernel/.venv`, seeds `pip`, installs the validated runtime, resolves model weights, and builds the megakernel extension. It also attempts to install `flash-attn==2.8.3` with `TORCH_CUDA_ARCH_LIST=12.0` for RTX 5090/Blackwell. Set `REQUIRE_FLASH_ATTN=1` before running bootstrap if you want setup to fail loudly when Flash Attention cannot be built.
 
 ### 2. Runtime config
-
-Create a Pipecat runtime env from the new template:
 
 ```bash
 cp -n .env.pipecat.template .env.pipecat
@@ -136,14 +128,14 @@ These all have sensible defaults; set them only if you want to override:
 | `QWEN3_TTS_SUBTALKER_BATCH` | `1` | enable cross-slot subtalker batching service |
 | `QWEN3_TTS_SUBTALKER_BATCH_WINDOW_MS` | `1.5` | base batching window (ms) for the subtalker service |
 | `QWEN3_TTS_SUBTALKER_BATCH_MAX_B` | `8` | maximum batch size the service will form |
-| `QWEN3_TTS_SUBTALKER_BATCH_ADAPTIVE_WINDOW` | `1` | suppress window wait after a singleton served (helps c1) |
+| `QWEN3_TTS_SUBTALKER_BATCH_ADAPTIVE_WINDOW` | `1` | suppress window wait after a singleton served |
 | `QWEN3_TTS_SUBTALKER_BATCH_WARMUP` | `1` | run B=1..4 × kv_len=0..7 warmup at service init |
 | `QWEN3_TTS_PREFILL_OPTIMIZED` | `1` | cache request-independent speaker/language scaffold tensors |
 | `QWEN3_TTS_PREWARM_BACKENDS` | `1` | run synthetic warm request at server load time |
 | `QWEN3_TTS_ANTI_CHEAT` | `0` | disable prompt/projection caches for honest benchmarks |
 | `QWEN3_TTS_SYNC_TIMING` | `0` | `cuda.synchronize` around phase timing for hot-path attribution |
 | `QWEN3_TTS_AUDIO_DECODE_OVERLAP` | `0` | run incremental tokenizer decode on a worker CUDA stream |
-| `QWEN3_TTS_TALKER_BATCH` | `0` | enable Stage-2 batched talker dispatcher (requires batched kernel — currently `NotImplementedError`) |
+| `QWEN3_TTS_TALKER_BATCH` | `0` | enable scaffolded batched talker dispatcher (requires batched kernel — currently `NotImplementedError`) |
 | `QWEN3_TTS_PER_SLOT_STREAM` | `0` | give each backend its own CUDA stream (needs event-based sync — scaffolding only) |
 | `QWEN3_TTS_DYNAMO_CACHE_SIZE_LIMIT` | `256` | dynamo recompile cache size |
 | `QWEN3_TTS_DYNAMO_ACCUM_CACHE_SIZE_LIMIT` | `1024` | dynamo accumulated cache size |
@@ -290,7 +282,7 @@ kernel/.venv/bin/python scripts/benchmark_roundtrip.py \
 
 ## Current Measurements
 
-These are the headline numbers on the remote RTX 5090 VM on 2026-05-16. They are intentionally reported as measured, not idealized.
+Measured on the remote RTX 5090 VM on 2026-05-16. Reported as measured, not idealized.
 
 Runtime:
 
@@ -300,56 +292,45 @@ Runtime:
 - benchmark env: `QWEN3_TTS_ANTI_CHEAT=1`, `QWEN3_TTS_SYNC_TIMING=0`
 - subtalker compile: `QWEN3_TTS_SUBTALKER_COMPILE=1`
 - subtalker batching: `QWEN3_TTS_SUBTALKER_BATCH=1`
-- prefill optimization: `QWEN3_TTS_PREFILL_OPTIMIZED=1`, `QWEN3_TTS_PREFILL_KERNEL=0`, `QWEN3_TTS_PREWARM_BACKENDS=1`
+- prefill: `QWEN3_TTS_PREFILL_OPTIMIZED=1`, `QWEN3_TTS_PREFILL_KERNEL=0`, `QWEN3_TTS_PREWARM_BACKENDS=1`
 - decode cadence: `adaptive(mid=4, late=8@24, ctx=25)`
-- scheduler mode: `scheduler_scalar`, max active requests = 4
-- kernel path reported by service: `qwen_megakernel_C.decode_hidden_fp32_head`
+- scheduler: `scheduler_scalar`, max active requests = 4
+- kernel path: `qwen_megakernel_C.decode_hidden_fp32_head`
 
-### Single-stream warm-path numbers (direct backend)
+### Single-stream direct-backend (warm path)
 
 `vivian` voice, `english`, `max_new_tokens=64`:
 
 | text | wall_s | RTF | TTFC ms | subtalker_ms |
 | --- | ---: | ---: | ---: | ---: |
-| `ready` | `0.555` | **`0.289`** | `53.3` | `432.3` |
-| `the city is tehran` | `0.785` | **`0.280`** | `53.5` | `628.9` |
-| `performance benchmark testing` | `0.805` | **`0.279`** | `53.2` | `648.4` |
+| `ready` | `0.555` | `0.289` | `53.3` | `432.3` |
+| `the city is tehran` | `0.785` | `0.280` | `53.5` | `628.9` |
+| `performance benchmark testing` | `0.805` | `0.279` | `53.2` | `648.4` |
 
-### Concurrent c4 benchmark (32 requests, 4 req/s, jitter 250ms, anti-cheat caches off)
-
-The headline result of this submission:
+### Concurrent HTTP benchmark (32 requests, 4 req/s, jitter 250 ms, anti-cheat caches off)
 
 | concurrency | successful | TTFC p50 / p90 / p99 ms | RTF p50 / p90 / p99 | max chunk gap p99 ms | GPU util avg / max |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | 1 | 16/16 | `136 / 139 / 140` | `0.474 / 0.483 / 0.491` | `286` | `99.5% / 100%` |
-| **4** | **32/32** | **`167 / 264 / 308`** | **`0.588 / 1.14 / 1.30`** | **`851`** | **`97.1% / 100%`** |
+| 4 | 32/32 | `167 / 264 / 308` | `0.588 / 1.14 / 1.30` | `851` | `97.1% / 100%` |
 
-For comparison, pre-batching baseline numbers from the same benchmark (commit `0c55fa8`, same env, same protocol):
-
-| concurrency | TTFC p50 / p90 / p99 ms | RTF p50 / p90 / p99 | GPU util avg |
-| --- | ---: | ---: | ---: |
-| 1 | `109 / 111 / 268` | `0.781 / 0.788 / 0.892` | `9.0%` |
-| 4 | `267 / 482 / 513` | `2.641 / 3.242 / 3.638` | `18.6%` |
-
-### Stage-1/Stage-2 benchmark artifacts
+### Benchmark artifacts
 
 - [benchmark_results/stage1_c1.json](/root/qwen3-tts-pipecat/benchmark_results/stage1_c1.json)
 - [benchmark_results/stage1_c4.json](/root/qwen3-tts-pipecat/benchmark_results/stage1_c4.json)
 - [benchmark_results/stage2_c1.json](/root/qwen3-tts-pipecat/benchmark_results/stage2_c1.json)
 - [benchmark_results/stage2_c4.json](/root/qwen3-tts-pipecat/benchmark_results/stage2_c4.json)
-- [benchmark_results/prefill_opt_c1.json](/root/qwen3-tts-pipecat/benchmark_results/prefill_opt_c1.json) (pre-batching baseline)
-- [benchmark_results/prefill_opt_c4.json](/root/qwen3-tts-pipecat/benchmark_results/prefill_opt_c4.json) (pre-batching baseline)
 
 ### Parity / sanity check
 
-`scripts/check_tts_parity.py` returns `"ok": true` for the three test texts (`ready`, `the city is tehran`, `performance benchmark testing`) on both the scalar path and the `--use-subtalker-service` path. First-frame codec codes are bit-identical between paths.
+`scripts/check_tts_parity.py` returns `"ok": true` for `ready`, `the city is tehran`, and `performance benchmark testing` on both the scalar path and the `--use-subtalker-service` path. First-frame codec codes are bit-identical between paths.
 
-Phase-level timing from a `QWEN3_TTS_SYNC_TIMING=1` parity run:
+Phase timing from a `QWEN3_TTS_SYNC_TIMING=1` parity run on `text=ready`, `max_new_tokens=64`:
 
-- prefill: `219.8 ms` on the first backend request (warm: `23.8 ms`)
-- subtalker / code predictor: `1250.1 ms` baseline, `432.3 ms` after `torch.compile`, much lower per-row under c4 batching
-- talker custom-kernel decode: `33.6 ms`
-- speech tokenizer / audio decode: `287.7 ms`
+- prefill: `219.8 ms` first request, `23.8 ms` warm same-backend
+- subtalker / code predictor: `432.3 ms`
+- talker custom-kernel decode: `~2 ms` / step, `~33 ms` for the whole utterance
+- speech tokenizer / audio decode: `287.7 ms` summed across chunks
 
 ## Architecture Summary
 
@@ -367,69 +348,55 @@ Phase-level timing from a `QWEN3_TTS_SYNC_TIMING=1` parity run:
 ### Why this layout
 
 - Scheduler-level scalar slot parallelism is the cheapest correct way to admit multiple concurrent requests without a true batched megakernel.
-- The talker megakernel is scalar by design (single-token, hand-rolled). Each slot's per-step CUDA work is `~2 ms`.
-- The dominant cost was the subtalker, which is a HF code-predictor module that benefits massively from `torch.compile` (`2.9×` single-stream) and from cross-slot batching (`5.2×` GPU util under c4).
-- The talker megakernel remaining as scalar is fine because its per-call cost is already small enough to fit inside the time spent on subtalker batching. A true batched megakernel is scaffolded (`batched_talker_service.py`) but would add only `~20-30 ms` per c4 request to the wins, with substantial rewrite cost — see `STILL_TO_IMPLEMENT.md`.
+- The talker megakernel is scalar by design (single-token, hand-rolled). Each slot's per-step CUDA work is small enough that batching it adds bounded payoff at c4.
+- The subtalker is a HF code-predictor module dispatched per-frame from each slot. Routing those calls through a single owner thread that batches them into one GPU forward is what keeps the GPU saturated under concurrent load.
+- A true batched talker megakernel is scaffolded (`batched_talker_service.py`) but the CUDA-side rewrite has not been done; see `STILL_TO_IMPLEMENT.md`.
 
 ## Remaining Bottlenecks
 
-After Stage 1 + Stage 2 finalization:
-
-1. **Audio decode** (`~12 ms/frame`) is now a larger relative fraction of per-frame cost on c4. The overlap path (`QWEN3_TTS_AUDIO_DECODE_OVERLAP=1`) is implemented and bit-identical but was measured pre-Stage-1; it should be re-evaluated on the current build.
-2. **CUDA graph capture for the subtalker step** is the single highest-payoff remaining change.
-3. **True batched CUDA talker megakernel** unblocks higher concurrency tiers (c8+) but is bounded payoff at c4 (~20-30 ms per request). Stage-2 scaffolding is committed; the CUDA-side rewrite has five specific changes documented in `batched_talker_service.py`.
-4. **Talker prefill** is still PyTorch by default. The experimental megakernel prefill path matched the first token but drifted on full utterance parity; kept off.
-5. **fp32 LM-head / argmax fusion** is small but free.
-6. **Long-form talker generation** is still less efficient than the raw text decode path.
+1. Audio decode (`~12 ms / frame`) is the next-largest per-frame cost on c4. The overlap path (`QWEN3_TTS_AUDIO_DECODE_OVERLAP=1`) is implemented and bit-identical but off by default; worth re-measuring on the current build.
+2. CUDA graph capture for the subtalker step is the single highest-payoff remaining change.
+3. True batched CUDA talker megakernel unblocks higher concurrency tiers (c8+) but is bounded payoff at c4. The Python dispatcher exists; the CUDA-side rewrite has five specific changes documented in `batched_talker_service.py`.
+4. Talker prefill is still PyTorch by default. The experimental megakernel prefill path matched the first token but drifted on full utterance parity; kept off.
+5. fp32 LM-head / argmax fusion is small but free.
+6. Long-form talker generation is still less efficient than the raw text decode path.
 
 Cold-start trade-offs:
 - `~8 s` startup compile warmup when the backend loads (one-time per process)
 - Additional `~5-8 s` warmup for the batched subtalker service to compile B=1..4 shape variants
-- KV-cache memory increases from `~4.7 GiB` (pre-batching) to `~8.0 GiB` peak at c4 (within RTX 5090's 32 GiB)
+- KV-cache memory peak `~8.0 GiB` at c4 (within RTX 5090's 32 GiB)
 
 ## How TTFC And RTF Were Calculated
 
 ### Direct backend TTS numbers
 
-The warm and cold local TTS numbers in `Current Measurements` were computed from the backend stats object returned by [megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py#L653).
+The single-stream warm-path numbers were computed from the backend stats object returned by [megakernel_talker.py](/root/qwen3-tts-pipecat/services/tts_qwen3/megakernel_talker.py#L653).
 
-- `ttfc_ms`
-  - recorded when the first non-empty decoded audio chunk is yielded
-- `generation_s`
-  - total CUDA-event elapsed generation time
-- `audio_s`
-  - total emitted audio duration in seconds
-- `rtf`
-  - `rtf = generation_s / audio_s`
+- `ttfc_ms`: recorded when the first non-empty decoded audio chunk is yielded
+- `generation_s`: total CUDA-event elapsed generation time
+- `audio_s`: total emitted audio duration in seconds
+- `rtf = generation_s / audio_s`
 
 ### Concurrent benchmark numbers
 
-The c1/c4 numbers in `Current Measurements` come from `scripts/benchmark_concurrent_tts.py`, which spawns jittered client requests and measures observed client-side time to first PCM chunk and total client-side stream time. RTF is computed from the PCM byte count: `audio_s = raw_bytes / (sample_rate * 2)`.
+The c1/c4 numbers come from `scripts/benchmark_concurrent_tts.py`, which spawns jittered client requests and measures observed client-side time to first PCM chunk and total client-side stream time. RTF is computed from the PCM byte count: `audio_s = raw_bytes / (sample_rate * 2)`.
 
 ### Live Pipecat turn numbers
 
 The live round-trip numbers come from [pipecat_demo/app.py](/root/qwen3-tts-pipecat/pipecat_demo/app.py).
 
-- `ttfc_ms`
-  - measured from request start to the first received PCM body chunk
-  - `/synthesize_binary` intentionally reports `X-TTFC-Ms: na` because the server cannot know TTFC before response headers are sent
+- `ttfc_ms`: measured from request start to the first received PCM body chunk. `/synthesize_binary` intentionally reports `X-TTFC-Ms: na` because the server cannot know TTFC before response headers are sent.
 - `audio_s = raw_bytes / (sample_rate * 2)`
 - `rtf = tts_stream_s / audio_s`
 
 ## Deliverables Mapping
 
-- Working repo with build instructions:
-  - covered by the `Setup` section and [scripts/bootstrap_qwen_megakernel.sh](/root/qwen3-tts-pipecat/scripts/bootstrap_qwen_megakernel.sh)
-- Short README with architecture decisions, kernel modifications, and how to run the demo:
-  - this file
-- Performance numbers:
-  - reported in `Current Measurements`; full write-up in `PERFORMANCE_NOTES.md`
-- End-to-end latency and streaming confirmation:
-  - reported via the live Pipecat metric lines and [scripts/benchmark_roundtrip.py](/root/qwen3-tts-pipecat/scripts/benchmark_roundtrip.py)
-- Honest gap list:
-  - `STILL_TO_IMPLEMENT.md`
-- Demo recording:
-  - not stored in the repo; attach separately as an out-of-repo submission artifact
+- Working repo with build instructions: `Setup` section and [scripts/bootstrap_qwen_megakernel.sh](/root/qwen3-tts-pipecat/scripts/bootstrap_qwen_megakernel.sh)
+- Short README with architecture decisions, kernel modifications, and how to run the demo: this file
+- Performance numbers: `Current Measurements` (this file); narrative of how they got here is in `PERFORMANCE_NOTES.md`
+- End-to-end latency and streaming confirmation: the live Pipecat metric lines and [scripts/benchmark_roundtrip.py](/root/qwen3-tts-pipecat/scripts/benchmark_roundtrip.py)
+- Honest gap list: `STILL_TO_IMPLEMENT.md`
+- Demo recording: attached separately as an out-of-repo submission artifact
 
 ## References
 
