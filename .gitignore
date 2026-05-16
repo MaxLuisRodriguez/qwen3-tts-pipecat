@@ -51,4 +51,5 @@ services/**/.hf_home/
 services/**/.torch_extensions/
 kernel/weights/
 smoke_test.log
-=4.57.0
+run_local.log
+/tmp/tts_server.log
