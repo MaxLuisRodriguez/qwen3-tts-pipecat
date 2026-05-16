@@ -171,6 +171,22 @@ class TalkerMegakernelBackend:
 
         self._subtalker_service = subtalker_service
 
+        # Optional per-slot CUDA stream. When enabled (QWEN3_TTS_PER_SLOT_STREAM=1)
+        # the slot wraps its CUDA work in a private stream so concurrent slots
+        # don't serialize on the default stream. Off by default because:
+        # (a) the talker megakernel is not the steady-state bottleneck at c4
+        # after the subtalker batching service lands, and (b) interactions
+        # between the per-slot stream and the cross-slot subtalker service
+        # introduce stream-ordering gaps -- enabling this knob naively stalled
+        # c4 traffic in testing. Keeping the wiring in place so a follow-up
+        # can add explicit event/wait synchronization between the slot stream
+        # and the subtalker service's owner-thread stream.
+        self._per_slot_stream_enabled = (
+            os.getenv("QWEN3_TTS_PER_SLOT_STREAM", "0") == "1"
+            and torch.cuda.is_available()
+        )
+        self._slot_stream: torch.cuda.Stream | None = None
+
         self._decode_from_hidden = torch.ops.qwen_megakernel_C.decode_from_hidden
         self._decode_hidden_only = torch.ops.qwen_megakernel_C.decode_hidden_only
         self._decode_hidden_fp32_head = torch.ops.qwen_megakernel_C.decode_hidden_fp32_head
@@ -260,6 +276,9 @@ class TalkerMegakernelBackend:
             except Exception:
                 self._subtalker_compile_enabled = False
                 self._subtalker_model_compiled = self._subtalker_model
+
+        if self._per_slot_stream_enabled:
+            self._slot_stream = torch.cuda.Stream(device=self._device)
 
         self._layer_weights_packed = self._pack_layer_weights()
         self._final_norm_weight = self._talker.model.norm.weight.contiguous()
@@ -1230,7 +1249,11 @@ class TalkerMegakernelBackend:
                 finally:
                     _shutdown_audio_worker()
 
-            with _audio_worker_cleanup_ctx(), torch.inference_mode():
+            if self._slot_stream is not None:
+                _slot_stream_ctx = torch.cuda.stream(self._slot_stream)
+            else:
+                _slot_stream_ctx = contextlib.nullcontext()
+            with _slot_stream_ctx, _audio_worker_cleanup_ctx(), torch.inference_mode():
                 self._reset_runtime()
                 started = torch.cuda.Event(enable_timing=True)
                 ended = torch.cuda.Event(enable_timing=True)
